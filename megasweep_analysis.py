@@ -544,34 +544,37 @@ def compute_rc_peak_position_map(
 # 6.  Transforms
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_transformed_coords(X2D, Y2D, ratio, tg_is_y=True):
+def compute_transformed_coords(X2D, Y2D, ratio, tg_is_y=True, convention="TG+rBG"):
     """
-    Compute Efield / Doping from original gate grids.
+    Compute two transformed coordinate grids from raw gate grids.
 
-    Convention:
-        Doping = TG + ratio * BG
-        Efield = TG - ratio * BG
+    Two conventions are supported:
+
+        "TG+rBG"  (default)  D = TG + ratio·BG,  E = TG - ratio·BG
+        "rTG+BG"             D = ratio·TG + BG,  E = ratio·TG - BG
 
     Parameters
     ----------
-    X2D, Y2D : 2-D grids from build_grid (rows = x_col, cols = y_col)
-    ratio    : float, lever-arm ratio (notebook used 0.9)
-    tg_is_y  : bool
-        True  → TG = Y2D (second column), BG = X2D (first column)
-        False → TG = X2D, BG = Y2D
+    X2D, Y2D   : 2-D grids from build_grid
+    ratio      : float, lever-arm ratio
+    tg_is_y    : bool — True → TG = Y2D, BG = X2D; False → reversed
+    convention : str, one of "TG+rBG" or "rTG+BG"
 
     Returns
     -------
-    Doping2D, Efield2D : same shape as X2D/Y2D
+    Axis1_2D, Axis2_2D : same shape as X2D/Y2D
     """
     if tg_is_y:
         TG, BG = Y2D, X2D
     else:
         TG, BG = X2D, Y2D
 
-    Doping = TG + ratio * BG
-    Efield = TG - ratio * BG
-    return Doping, Efield
+    if convention == "TG+rBG":
+        return TG + ratio * BG, TG - ratio * BG   # D, E
+    elif convention == "rTG+BG":
+        return ratio * TG + BG, ratio * TG - BG   # D, E
+    else:
+        raise ValueError(f"Unknown convention: {convention!r}. Use 'TG+rBG' or 'rTG+BG'.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -581,97 +584,106 @@ def compute_transformed_coords(X2D, Y2D, ratio, tg_is_y=True):
 def extract_line_cut(raw_data, x_data, y_data, energy,
                      cut_type='doping', c_value=0.0,
                      ratio=0.9, epsilon=0.03,
-                     tg_is_y=True):
+                     tg_is_y=True, convention='TG+rBG'):
     """
-    Extract a line cut at constant Doping or constant Efield.
+    Extract a line cut at a constant value of a transformed coordinate.
 
     Parameters
     ----------
-    raw_data  : (N, 2+n_wl) array  [x, y, spectrum…]
+    raw_data   : (N, 2+n_wl) array  [x, y, spectrum…]
     x_data, y_data : (N,) arrays
-    energy    : (n_wl,) array in eV
-    cut_type  : 'doping' or 'efield'
-    c_value   : float, the constant value to cut along
-    ratio     : float, lever-arm ratio
-    epsilon   : float, tolerance window around c_value
+    energy     : (n_wl,) array in eV
+    cut_type   : 'doping' or 'efield'
+    c_value    : float, the constant value to cut along
+    ratio      : float, lever-arm ratio r
+    epsilon    : float, half-width of the acceptance window around c_value.
+                 Only data points where |value - c_value| <= epsilon are
+                 included.  No nearest-neighbour approximation is performed;
+                 if no points fall within the window the returned arrays are
+                 empty.
     tg_is_y   : bool, if True TG=y_data, BG=x_data; else reversed
+    convention : 'TG+rBG'  →  D = TG + r·BG,  E = TG - r·BG
+                 'rTG+BG'  →  D = r·TG + BG,   E = r·TG - BG
 
     Returns
     -------
-    dict with keys:
-        'axis_values'   : (n_sel,) values along the varying axis
-        'axis_label'    : str label for the varying axis
-        'spectra'       : (n_sel, n_wl) spectral intensity
-        'energy'        : (n_wl,) energy array
-        'x_sel'         : (n_sel,) x values of selected points
-        'y_sel'         : (n_sel,) y values of selected points
-        'cut_type'      : 'doping' or 'efield'
-        'c_value_used'  : actual c_value that was matched
+    dict with keys: axis_values, axis_label, spectra, energy,
+                    x_sel, y_sel, cut_type, c_value_used, ratio
     """
     if tg_is_y:
         TG, BG = y_data, x_data
     else:
         TG, BG = x_data, y_data
 
-    doping_flat = TG + ratio * BG
-    efield_flat = TG - ratio * BG
+    r = ratio
+    if convention == 'TG+rBG':
+        D = TG + r * BG
+        E = TG - r * BG
+        d_label = f'TG + {r}·BG (V)'
+        e_label = f'TG − {r}·BG (V)'
+    elif convention == 'rTG+BG':
+        D = r * TG + BG
+        E = r * TG - BG
+        d_label = f'{r}·TG + BG (V)'
+        e_label = f'{r}·TG − BG (V)'
+    else:
+        raise ValueError(f"Unknown convention: {convention!r}")
 
     if cut_type == 'doping':
-        line_values = doping_flat      # the constant axis
-        vary_values = efield_flat      # the varying axis
-        vary_label = f'Efield = TG - {ratio}·BG (V)'
+        line_values = D
+        vary_values = E
+        vary_label  = f'E = {e_label}'
     elif cut_type == 'efield':
-        line_values = efield_flat
-        vary_values = doping_flat
-        vary_label = f'Doping = TG + {ratio}·BG (V)'
+        line_values = E
+        vary_values = D
+        vary_label  = f'D = {d_label}'
     else:
-        raise ValueError("cut_type must be 'doping' or 'efield'")
+        raise ValueError(f"Unknown cut_type: {cut_type!r}. Use 'doping' or 'efield'.")
 
-    # find points within epsilon of c_value
+    # Round to 9 d.p. to eliminate floating-point noise before matching.
+    # This must agree with find_all_cut_values which also rounds to 9 d.p.
+    line_values = np.round(line_values, 9)
+    c_value = round(c_value, 9)
+
     dist = np.abs(line_values - c_value)
     mask = dist <= epsilon
-
-    if not np.any(mask):
-        # snap to nearest achievable value
-        nearest_idx = np.argmin(dist)
-        c_actual = line_values[nearest_idx]
-        import warnings
-        warnings.warn(
-            f"No points within epsilon={epsilon} of {cut_type}={c_value:.4f}. "
-            f"Snapping to nearest: {c_actual:.4f}"
-        )
-        mask = np.abs(line_values - c_actual) <= 1e-10
-    else:
-        c_actual = c_value
-
-    # de-duplicate: for each unique vary_value bucket keep closest point
     sel_idx = np.where(mask)[0]
-    unique_vary = np.unique(np.round(vary_values[sel_idx], 6))
+
+    if sel_idx.size == 0:
+        empty = np.empty(0, dtype=float)
+        return {
+            'axis_values': empty,
+            'axis_label':  vary_label,
+            'spectra':     np.empty((0, raw_data.shape[1] - 2), dtype=float),
+            'energy':      energy,
+            'x_sel':       empty,
+            'y_sel':       empty,
+            'cut_type':    cut_type,
+            'c_value_used': c_value,
+            'ratio':       ratio,
+        }
+
+    # De-duplicate: for each unique vary_value bucket keep the point closest to c_value
+    unique_vary = np.unique(np.round(vary_values[sel_idx], 9))
     keep = []
     for uv in unique_vary:
-        candidates = sel_idx[np.argmin(dist[sel_idx])]  # fallback
-        bucket = sel_idx[np.abs(vary_values[sel_idx] - uv) < 1e-6]
-        if len(bucket) > 0:
-            keep.append(bucket[np.argmin(dist[bucket])])
+        bucket = sel_idx[np.abs(vary_values[sel_idx] - uv) < 1e-9]
+        if bucket.size > 0:
+            keep.append(int(bucket[np.argmin(dist[bucket])]))
+
     keep = np.array(keep, dtype=int)
-
-    # sort by vary_values
-    order = np.argsort(vary_values[keep])
-    keep = keep[order]
-
-    spectra = raw_data[keep, 2:]
-    axis_values = vary_values[keep]
+    keep = keep[np.argsort(vary_values[keep])]
 
     return {
-        'axis_values': axis_values,
-        'axis_label': vary_label,
-        'spectra': spectra,
-        'energy': energy,
-        'x_sel': x_data[keep],
-        'y_sel': y_data[keep],
-        'cut_type': cut_type,
-        'c_value_used': c_actual,
-        'ratio': ratio,
+        'axis_values':  vary_values[keep],
+        'axis_label':   vary_label,
+        'spectra':      raw_data[keep, 2:],
+        'energy':       energy,
+        'x_sel':        x_data[keep],
+        'y_sel':        y_data[keep],
+        'cut_type':     cut_type,
+        'c_value_used': c_value,
+        'ratio':        ratio,
     }
 
 
@@ -679,7 +691,8 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
 # 8.  Plotting
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon, min_points=2, tg_is_y=True):
+def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
+                        min_points=2, tg_is_y=True, convention='TG+rBG'):
     """
     Find representative constant-axis values for batch line-cut extraction.
 
@@ -691,14 +704,15 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon, min_points=2, 
     epsilon        : float, half-width tolerance used by extract_line_cut
     min_points     : int, minimum points required to keep a cut
     tg_is_y        : bool, if True TG=y_data and BG=x_data
+    convention     : 'TG+rBG' or 'rTG+BG' — controls the D/E formula
 
     Returns
     -------
     list of float
         Sorted representative cut centers suitable for extract_line_cut().
     """
-    if epsilon <= 0:
-        raise ValueError("epsilon must be positive.")
+    if epsilon < 0:
+        raise ValueError("epsilon must be zero or positive.")
     if min_points < 1:
         raise ValueError("min_points must be at least 1.")
 
@@ -712,12 +726,26 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon, min_points=2, 
     else:
         TG, BG = x_vals, y_vals
 
-    if cut_type == 'doping':
-        line_values = TG + ratio * BG
-    elif cut_type == 'efield':
-        line_values = TG - ratio * BG
+    if convention == 'TG+rBG':
+        D = TG + ratio * BG
+        E = TG - ratio * BG
+    elif convention == 'rTG+BG':
+        D = ratio * TG + BG
+        E = ratio * TG - BG
     else:
-        raise ValueError("cut_type must be 'doping' or 'efield'")
+        raise ValueError(f"Unknown convention: {convention!r}")
+
+    if cut_type == 'doping':
+        line_values = D
+    elif cut_type == 'efield':
+        line_values = E
+    else:
+        raise ValueError(f"Unknown cut_type: {cut_type!r}. Use 'doping' or 'efield'.")
+
+    # Round to 9 d.p. to eliminate floating-point noise before clustering.
+    # Grid steps (~0.18 V) are orders of magnitude above FP error (~1e-15),
+    # so this is always safe and is essential when epsilon=0.
+    line_values = np.round(line_values, 9)
 
     finite_values = np.sort(line_values[np.isfinite(line_values)])
     if finite_values.size == 0:
@@ -726,7 +754,7 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon, min_points=2, 
     clusters = []
     current_cluster = [float(finite_values[0])]
     current_center = float(finite_values[0])
-    gap_threshold = 2.0 * float(epsilon)
+    gap_threshold = max(2.0 * float(epsilon), 1e-9)
 
     for value in finite_values[1:]:
         value = float(value)

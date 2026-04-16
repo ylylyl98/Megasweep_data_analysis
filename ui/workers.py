@@ -174,6 +174,7 @@ class AnalysisRefreshWorker(BaseWorker):
         tg_is_y: bool,
         mode: str = "PL",
         background_spectra=None,
+        convention: str = "TG+rBG",
     ):
         super().__init__()
         self.data = data
@@ -187,6 +188,7 @@ class AnalysisRefreshWorker(BaseWorker):
         self.tg_is_y = tg_is_y
         self.mode = mode
         self.background_spectra = background_spectra
+        self.convention = convention
 
     def process(self) -> dict:
         tasks = set(self.tasks)
@@ -231,17 +233,19 @@ class AnalysisRefreshWorker(BaseWorker):
         transformed_map = None
         if {"intensity_transformed", "peak_transformed"} & tasks:
             self.log.emit("Computing transformed coordinate view...")
-            doping2d, efield2d = compute_transformed_coords(
+            axis1_2d, axis2_2d = compute_transformed_coords(
                 original_map["X2D"],
                 original_map["Y2D"],
                 self.ratio,
                 tg_is_y=self.tg_is_y,
+                convention=self.convention,
             )
             transformed_map = {
-                "X2D": doping2d,
-                "Y2D": efield2d,
+                "X2D": axis1_2d,
+                "Y2D": axis2_2d,
                 "Z2D": original_map["Z2D"],
                 "ratio": self.ratio,
+                "convention": self.convention,
             }
             payload["transformed_map"] = transformed_map
 
@@ -318,25 +322,28 @@ class IntensityWorker(BaseWorker):
 
 
 class TransformWorker(BaseWorker):
-    def __init__(self, original_map: dict, ratio: float, tg_is_y: bool):
+    def __init__(self, original_map: dict, ratio: float, tg_is_y: bool, convention: str = "TG+rBG"):
         super().__init__()
         self.original_map = original_map
         self.ratio = ratio
         self.tg_is_y = tg_is_y
+        self.convention = convention
 
     def process(self) -> dict:
         self.log.emit("Computing transformed coordinates...")
-        doping2d, efield2d = compute_transformed_coords(
+        axis1_2d, axis2_2d = compute_transformed_coords(
             self.original_map["X2D"],
             self.original_map["Y2D"],
             self.ratio,
             tg_is_y=self.tg_is_y,
+            convention=self.convention,
         )
         return {
-            "X2D": doping2d,
-            "Y2D": efield2d,
+            "X2D": axis1_2d,
+            "Y2D": axis2_2d,
             "Z2D": self.original_map["Z2D"],
             "ratio": self.ratio,
+            "convention": self.convention,
         }
 
 
@@ -394,6 +401,7 @@ class LineWorker(BaseWorker):
         ratio: float,
         tg_is_y: bool = True,
         background_spectra=None,
+        convention: str = "TG+rBG",
     ):
         super().__init__()
         self.data = data
@@ -401,6 +409,7 @@ class LineWorker(BaseWorker):
         self.ratio = ratio
         self.tg_is_y = tg_is_y
         self.background_spectra = background_spectra
+        self.convention = convention
 
     def process(self) -> dict:
         if self.background_spectra is not None:
@@ -429,12 +438,17 @@ class LineWorker(BaseWorker):
                 ratio=self.ratio,
                 epsilon=spec["epsilon"],
                 tg_is_y=self.tg_is_y,
+                convention=self.convention,
             )
-            results.append(line_cut)
-            self.log.emit(
-                f"  → {len(line_cut['axis_values'])} points selected "
-                f"(actual value: {line_cut['c_value_used']:.4f} V)"
-            )
+            n_pts = len(line_cut['axis_values'])
+            if n_pts == 0:
+                self.log.emit(
+                    f"  → 0 points found within epsilon={spec['epsilon']:.4f} V — "
+                    f"no data returned for this cut"
+                )
+            else:
+                results.append(line_cut)
+                self.log.emit(f"  → {n_pts} points selected")
 
         return {"line_cuts": results}
 
@@ -450,6 +464,7 @@ class BatchLineWorker(BaseWorker):
         ratio: float,
         tg_is_y: bool = True,
         background_spectra=None,
+        convention: str = "TG+rBG",
     ):
         super().__init__()
         self.data = data
@@ -460,6 +475,7 @@ class BatchLineWorker(BaseWorker):
         self.ratio = ratio
         self.tg_is_y = tg_is_y
         self.background_spectra = background_spectra
+        self.convention = convention
 
     def process(self) -> dict:
         os.makedirs(self.output_dir, exist_ok=True)
@@ -479,7 +495,12 @@ class BatchLineWorker(BaseWorker):
         saved_files: list[str] = []
         total_cuts = 0
 
+        _subfolder = {"doping": "doping_fixed", "efield": "efield_fixed"}
+
         for cut_type in self.cut_types:
+            subfolder = os.path.join(self.output_dir, _subfolder.get(cut_type, cut_type))
+            os.makedirs(subfolder, exist_ok=True)
+
             self.log.emit(f"Finding all {cut_type} cut values...")
             cut_values = find_all_cut_values(
                 self.data["x_data"],
@@ -488,6 +509,7 @@ class BatchLineWorker(BaseWorker):
                 self.ratio,
                 self.epsilon,
                 tg_is_y=self.tg_is_y,
+                convention=self.convention,
             )
             self.log.emit(f"Found {len(cut_values)} {cut_type} line cuts to extract.")
 
@@ -502,14 +524,15 @@ class BatchLineWorker(BaseWorker):
                     ratio=self.ratio,
                     epsilon=self.epsilon,
                     tg_is_y=self.tg_is_y,
+                    convention=self.convention,
                 )
                 if len(line_cut["axis_values"]) == 0:
                     continue
 
-                csv_path = os.path.join(
-                    self.output_dir,
-                    f"{self.source_name}_{cut_type}_{c_value:+.4f}.csv",
-                )
+                # Use 'n'/'p' prefix instead of '+'/'-' — '+' is invalid in Windows filenames
+                sign = "n" if c_value < 0 else "p"
+                stem = f"{self.source_name}_{cut_type}_{sign}{abs(c_value):.4f}"
+                csv_path = os.path.join(subfolder, f"{stem}.csv")
                 save_line_csv(line_cut, csv_path)
                 saved_files.append(csv_path)
 
@@ -523,7 +546,7 @@ class BatchLineWorker(BaseWorker):
                         cmap=cmap,
                         z_label=z_label,
                     )
-                    png_path = csv_path.replace(".csv", ".png")
+                    png_path = os.path.join(subfolder, f"{stem}.png")
                     save_figure(fig, png_path)
                     saved_files.append(png_path)
 

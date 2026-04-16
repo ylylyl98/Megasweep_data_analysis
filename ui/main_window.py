@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 from megasweep_analysis import (
     compute_rc_spectra,
     extract_line_cut,
+    find_all_cut_values,
     plot_line_cut_spectrogram,
     plot_map,
     save_line_csv,
@@ -768,11 +769,7 @@ class MainWindow(QMainWindow):
         self.line_workspace = QWidget()
         line_layout = QVBoxLayout(self.line_workspace)
         line_layout.setContentsMargins(8, 8, 8, 8)
-        line_layout.setSpacing(8)
-        self.line_preview_status = QLabel("Extract line cuts from the sidebar to preview them here.")
-        self.line_preview_status.setWordWrap(True)
-        self.line_preview_status.setStyleSheet("color:#5a7088;")
-        line_layout.addWidget(self.line_preview_status)
+        line_layout.setSpacing(0)
         self.line_plot_tab = PlotTab("Line Cuts")
         line_layout.addWidget(self.line_plot_tab, 1)
 
@@ -921,8 +918,17 @@ class MainWindow(QMainWindow):
         self.reflection_preview_status_label.setWordWrap(True)
         self.reflection_preview_status_label.setStyleSheet("color:#5a7088;")
 
-        formula = QLabel("Doping = TG + ratio × BG\nEfield = TG − ratio × BG")
-        formula.setStyleSheet("color:#5a7088; font-size:9px;")
+        self.convention_combo = QComboBox()
+        self.convention_combo.addItems([
+            "D = TG + r·BG,  E = TG − r·BG",
+            "D = r·TG + BG,  E = r·TG − BG",
+        ])
+        self.convention_combo.currentIndexChanged.connect(self._on_convention_changed)
+
+        self.formula_label = QLabel(self._formula_text())
+        self.formula_label.setWordWrap(True)
+        self.formula_label.setStyleSheet("color:#5a7088; font-size:9px;")
+
         self.analysis_status_label = QLabel("Load a CSV to start.")
         self.analysis_status_label.setWordWrap(True)
         self.analysis_status_label.setStyleSheet("color:#5a7088;")
@@ -936,7 +942,8 @@ class MainWindow(QMainWindow):
         form.addRow(self.baseline_form_label, self.baseline_spin)
 
         form.addRow("Ratio:", self.ratio_spin)
-        form.addRow("", formula)
+        form.addRow("Convention:", self.convention_combo)
+        form.addRow("", self.formula_label)
 
         # --- RC-specific rows (shown only when mode == "Reflection") ---
         self._rc_vbg_label = QLabel("Preview Vbg:")
@@ -1029,12 +1036,6 @@ class MainWindow(QMainWindow):
         form.setContentsMargins(0, 8, 0, 0)
         self.transform_group = group
 
-        self.ratio_spin = self._dspin(0.001, 100.0, 0.01, 4, 0.9)
-        self.ratio_spin.valueChanged.connect(self._on_ratio_changed)
-
-        formula = QLabel("Doping = TG + ratio * BG\nEfield = TG - ratio * BG")
-        formula.setStyleSheet("color:#5a7088; font-size:9px;")
-
         self.plot_transformed_btn = QPushButton("Plot Transformed Map")
         self.plot_transformed_btn.clicked.connect(self._start_transform_stage)
         self.plot_transformed_btn.setProperty("class", "primary")
@@ -1045,8 +1046,6 @@ class MainWindow(QMainWindow):
         self.save_transformed_csv_btn = QPushButton("Save CSV")
         self.save_transformed_csv_btn.clicked.connect(lambda: self._save_map("transformed", "csv"))
 
-        form.addRow("Ratio:", self.ratio_spin)
-        form.addRow("", formula)
         form.addRow("", self.plot_transformed_btn)
         form.addRow("", self._hrow(self.save_transformed_png_btn, self.save_transformed_csv_btn))
         return group
@@ -1110,18 +1109,6 @@ class MainWindow(QMainWindow):
         self.cuts_table.itemChanged.connect(self._on_linecut_settings_changed)
         layout.addWidget(self.cuts_table)
 
-        row_buttons = QHBoxLayout()
-        add_d = QPushButton("+ Doping")
-        add_e = QPushButton("+ Efield")
-        remove_btn = QPushButton("Remove Row")
-        add_d.clicked.connect(lambda: self._add_cut("doping", 0.0, 0.03))
-        add_e.clicked.connect(lambda: self._add_cut("efield", 0.0, 0.03))
-        remove_btn.clicked.connect(self._remove_selected_cut)
-        row_buttons.addWidget(add_d)
-        row_buttons.addWidget(add_e)
-        row_buttons.addWidget(remove_btn)
-        layout.addLayout(row_buttons)
-
         self.plot_lines_btn = QPushButton("Extract Line Cuts")
         self.plot_lines_btn.clicked.connect(self._start_line_stage)
         self.plot_lines_btn.setProperty("class", "primary")
@@ -1129,24 +1116,37 @@ class MainWindow(QMainWindow):
         self.plot_lines_btn.style().polish(self.plot_lines_btn)
         layout.addWidget(self.plot_lines_btn)
 
-        self.batch_epsilon_spin = self._dspin(0.001, 1.0, 0.01, 3, 0.03)
+        self.batch_epsilon_spin = self._dspin(0.0, 1.0, 0.01, 3, 0.0)
         self.extract_all_doping_btn = QPushButton("All Doping")
-        self.extract_all_doping_btn.clicked.connect(lambda: self._start_batch_line_stage(["doping"]))
+        self.extract_all_doping_btn.clicked.connect(
+            lambda: self._start_batch_line_stage(["doping"])
+        )
         self.extract_all_efield_btn = QPushButton("All Efield")
-        self.extract_all_efield_btn.clicked.connect(lambda: self._start_batch_line_stage(["efield"]))
+        self.extract_all_efield_btn.clicked.connect(
+            lambda: self._start_batch_line_stage(["efield"])
+        )
         self.extract_all_both_btn = QPushButton("All (Both)")
-        self.extract_all_both_btn.clicked.connect(lambda: self._start_batch_line_stage(["doping", "efield"]))
+        self.extract_all_both_btn.clicked.connect(
+            lambda: self._start_batch_line_stage(self._batch_cut_types(["axis1", "axis2"]))
+        )
+        self.batch_preview_btn = QPushButton("Preview")
+        self.batch_preview_btn.setToolTip("Count how many line cuts (and output files) each batch will produce.")
+        self.batch_preview_btn.clicked.connect(self._update_batch_preview)
         eps_label = QLabel("Batch ε:")
-        layout.addWidget(self._hrow(eps_label, self.batch_epsilon_spin))
+        layout.addWidget(self._hrow(eps_label, self.batch_epsilon_spin, self.batch_preview_btn))
         layout.addWidget(self._hrow(self.extract_all_doping_btn, self.extract_all_efield_btn, self.extract_all_both_btn))
+
+        self.batch_preview_label = QLabel("")
+        self.batch_preview_label.setWordWrap(True)
+        self.batch_preview_label.setStyleSheet("color:#5a7088; font-family: monospace;")
+        layout.addWidget(self.batch_preview_label)
 
         self.linecuts_status_label = QLabel("Line cuts use the transformed coordinate view and the current ratio setting.")
         self.linecuts_status_label.setWordWrap(True)
         self.linecuts_status_label.setStyleSheet("color:#5a7088;")
         layout.addWidget(self.linecuts_status_label)
 
-        self._add_cut("doping", 0.0, 0.03)
-        self._add_cut("efield", 0.0, 0.03)
+        self._add_cut("doping", 0.0, 0.0)
         return group
 
     @staticmethod
@@ -1242,7 +1242,6 @@ class MainWindow(QMainWindow):
             else:
                 self.map_status_label.setText("Load a CSV, choose settings, then refresh a map view.")
             self.linecuts_status_label.setText("Line cuts become available after a transformed map refresh.")
-            self.line_preview_status.setText("Extract line cuts from the sidebar to preview them here.")
             return
 
         dirty_names = {
@@ -1278,14 +1277,6 @@ class MainWindow(QMainWindow):
             )
         else:
             self.linecuts_status_label.setText("Line cuts match the current transformed coordinate settings.")
-
-        if self.state.figures.get("line_cuts") is None:
-            if self._reflection_preview_message:
-                self.line_preview_status.setText(self._reflection_preview_message)
-            else:
-                self.line_preview_status.setText("Extract line cuts from the sidebar to preview them here.")
-        else:
-            self.line_preview_status.setText("Showing the most recently extracted line-cut preview.")
 
     def _refresh_current_map_view(self) -> None:
         if self.state.data is None:
@@ -1330,6 +1321,7 @@ class MainWindow(QMainWindow):
             tg_is_y=True,
             mode=self.state.mode,
             background_spectra=self.state.background_spectra,
+            convention=self._current_convention(),
         )
         self._run_worker(worker, self._on_analysis_refresh_ready, context=context)
 
@@ -1685,7 +1677,6 @@ class MainWindow(QMainWindow):
             f"P2P={p2p_str} | Peak={pk_str}"
         )
         self.reflection_preview_status_label.setText(self._reflection_preview_message)
-        self.line_preview_status.setText(self._reflection_preview_message)
 
     def _on_intensity_settings_changed(self) -> None:
         if self.state.data is None:
@@ -1735,6 +1726,51 @@ class MainWindow(QMainWindow):
             "warn",
         )
         self._refresh_stage_states()
+
+    def _on_convention_changed(self) -> None:
+        self.formula_label.setText(self._formula_text())
+        convention = self._current_convention()
+        self.state.transform_convention = convention
+        if self.state.data is None:
+            return
+        self.state.transformed_map = None
+        self.state.peak_map_transformed = None
+        self.state.line_cut_specs = []
+        self.state.line_cut_results = []
+        self.state.figures.pop("transformed_map", None)
+        self.state.figures.pop("peak_map_transformed", None)
+        self.state.figures.pop("line_cuts", None)
+        self.line_plot_tab.clear()
+        self._mark_dirty("intensity_transformed", "peak_transformed", "line_cuts")
+        self._append_log(
+            f"Axis convention changed to '{convention}'. Transformed views and line cuts need refresh.",
+            "warn",
+        )
+        self._refresh_stage_states()
+
+    def _current_convention(self) -> str:
+        """Return the internal convention key for the current combo selection."""
+        return "TG+rBG" if self.convention_combo.currentIndex() == 0 else "rTG+BG"
+
+    def _formula_text(self) -> str:
+        """Return the D/E definition text for the current convention."""
+        idx = self.convention_combo.currentIndex() if hasattr(self, "convention_combo") else 0
+        if idx == 0:
+            return "D = TG + r·BG\nE = TG − r·BG"
+        else:
+            return "D = r·TG + BG\nE = r·TG − BG"
+
+    def _axis_labels(self) -> tuple[str, str]:
+        """Return (D label, E label) for the transformed map axes."""
+        r = self.ratio_spin.value()
+        if self._current_convention() == "TG+rBG":
+            return f"TG + {r}·BG (V)", f"TG − {r}·BG (V)"
+        else:
+            return f"{r}·TG + BG (V)", f"{r}·TG − BG (V)"
+
+    def _batch_cut_types(self, axes: list[str]) -> list[str]:
+        """Map 'axis1' (D) / 'axis2' (E) to 'doping'/'efield' strings."""
+        return [{"axis1": "doping", "axis2": "efield"}[a] for a in axes]
 
     def _on_peak_settings_changed(self) -> None:
         if self.state.data is None:
@@ -1839,7 +1875,8 @@ class MainWindow(QMainWindow):
             return
 
         self.state.csv_path = csv_path
-        self.state.output_dir = self.out_edit.text().strip() or os.path.dirname(csv_path)
+        csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
+        self.state.output_dir = os.path.join(os.path.dirname(csv_path), f"{csv_stem}_outputs")
         self.out_edit.setText(self.state.output_dir)
         self.state.selected_bg_col = vbg
         self.state.selected_tg_col = vtg
@@ -1873,6 +1910,7 @@ class MainWindow(QMainWindow):
             self.state.original_map,
             self.ratio_spin.value(),
             tg_is_y=True,
+            convention=self._current_convention(),
         )
         self._run_worker(worker, self._on_transform_ready, context="Stage 3: building transformed map")
 
@@ -1896,8 +1934,8 @@ class MainWindow(QMainWindow):
         self._run_worker(worker, self._on_peak_ready, context="Stage 4: computing peak map")
 
     def _start_line_stage(self) -> None:
-        if self.state.transformed_map is None or self._dirty_views.get("intensity_transformed", True):
-            self._append_log("Refresh the transformed map with the current settings before extracting line cuts.", "error")
+        if self.state.data is None:
+            self._append_log("Load a CSV before extracting line cuts.", "error")
             return
         if not self._validate_reflection_background_ready():
             return
@@ -1911,8 +1949,32 @@ class MainWindow(QMainWindow):
             self.state.current_ratio,
             tg_is_y=True,
             background_spectra=self.state.background_spectra if self.state.mode == "Reflection" else None,
+            convention=self._current_convention(),
         )
         self._run_worker(worker, self._on_lines_ready, context="Extracting line cuts")
+
+    def _update_batch_preview(self) -> None:
+        data = self.state.data
+        if data is None:
+            self.batch_preview_label.setText("No data loaded.")
+            return
+        x = data["x_data"]
+        y = data["y_data"]
+        ratio = self.state.current_ratio
+        epsilon = self.batch_epsilon_spin.value()
+        convention = self._current_convention()
+        try:
+            n_doping = len(find_all_cut_values(x, y, "doping", ratio, epsilon, convention=convention))
+            n_efield = len(find_all_cut_values(x, y, "efield", ratio, epsilon, convention=convention))
+        except Exception as exc:
+            self.batch_preview_label.setText(f"Preview error: {exc}")
+            return
+        lines = [
+            f"Doping : {n_doping:>4} cuts  →  {n_doping} CSV + {n_doping} PNG",
+            f"Efield : {n_efield:>4} cuts  →  {n_efield} CSV + {n_efield} PNG",
+            f"Both   : {n_doping + n_efield:>4} cuts  →  {n_doping + n_efield} CSV + {n_doping + n_efield} PNG",
+        ]
+        self.batch_preview_label.setText("\n".join(lines))
 
     def _start_batch_line_stage(self, cut_types: list[str]) -> None:
         if self.state.data is None or self.state.transformed_map is None or self._dirty_views.get("intensity_transformed", True):
@@ -1922,8 +1984,8 @@ class MainWindow(QMainWindow):
             return
 
         epsilon = self.batch_epsilon_spin.value()
-        if epsilon <= 0:
-            self._append_log("Batch epsilon must be greater than zero.", "error")
+        if epsilon < 0:
+            self._append_log("Batch epsilon must be zero or greater.", "error")
             return
 
         output_dir = self._ensure_output_dir()
@@ -1936,6 +1998,7 @@ class MainWindow(QMainWindow):
             self.state.current_ratio,
             tg_is_y=True,
             background_spectra=self.state.background_spectra if self.state.mode == "Reflection" else None,
+            convention=self._current_convention(),
         )
         context = f"Batch extracting {' + '.join(cut_types)} line cuts"
         self._run_worker(worker, self._on_batch_lines_ready, context=context)
@@ -2020,7 +2083,8 @@ class MainWindow(QMainWindow):
             os.makedirs(self.state.output_dir, exist_ok=True)
             return self.state.output_dir
         if self.state.csv_path:
-            output_dir = os.path.dirname(os.path.abspath(self.state.csv_path))
+            csv_stem = os.path.splitext(os.path.basename(self.state.csv_path))[0]
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(self.state.csv_path)), f"{csv_stem}_outputs")
             self.state.output_dir = output_dir
             os.makedirs(output_dir, exist_ok=True)
             self.out_edit.setText(output_dir)
@@ -2141,12 +2205,11 @@ class MainWindow(QMainWindow):
 
                     elif map_key == "transformed_map":
                         self.state.transformed_map = map_data
-                        x_name = "Doping (V)"
-                        y_name = "Efield (V)"
+                        x_name, y_name = self._axis_labels()
                         z_name = "RC Peak-to-Peak" if is_rc else "PL Intensity"
                         z_label = "RC Amplitude (a.u.)" if is_rc else "PL Intensity (a.u.)"
                         ratio = map_data.get("ratio", self.ratio_spin.value())
-                        title = f"{z_name} Map | Doping/Efield (ratio={ratio:.2f}){e_suffix}"
+                        title = f"{z_name} Map | Transformed (ratio={ratio:.4g}){e_suffix}"
                         self._dirty_views["intensity_transformed"] = False
                         figure_key = "transformed_map"
 
@@ -2163,12 +2226,11 @@ class MainWindow(QMainWindow):
 
                     elif map_key == "peak_map_transformed":
                         self.state.peak_map_transformed = map_data
-                        x_name = "Doping (V)"
-                        y_name = "Efield (V)"
+                        x_name, y_name = self._axis_labels()
                         z_name = "RC Peak Position" if is_rc else "Peak Energy"
                         z_label = "RC Peak Position (eV)" if is_rc else "Peak Energy (eV)"
                         ratio = map_data.get("ratio", self.ratio_spin.value())
-                        title = f"{z_name} Map | Doping/Efield (ratio={ratio:.2f}){e_suffix}"
+                        title = f"{z_name} Map | Transformed (ratio={ratio:.4g}){e_suffix}"
                         self._dirty_views["peak_transformed"] = False
                         figure_key = "peak_map_transformed"
 
@@ -2296,7 +2358,7 @@ class MainWindow(QMainWindow):
             self.preview_rc_btn.setEnabled(bool(has_data and is_rc and has_background))
             self.refresh_current_btn.setEnabled(bool(has_data and (not is_rc or has_background)))
             self.refresh_all_maps_btn.setEnabled(bool(has_data and (not is_rc or has_background)))
-            self.plot_lines_btn.setEnabled(bool(has_transformed_map))
+            self.plot_lines_btn.setEnabled(bool(has_data))
             self.extract_all_doping_btn.setEnabled(bool(has_transformed_map))
             self.extract_all_efield_btn.setEnabled(bool(has_transformed_map))
             self.extract_all_both_btn.setEnabled(bool(has_transformed_map))
@@ -2337,18 +2399,19 @@ class MainWindow(QMainWindow):
 
     def _on_transform_ready(self, result: dict) -> None:
         try:
+            x_label, y_label = self._axis_labels()
             self.state.transformed_map = result
-            self.state.transformed_map["x_name"] = "Doping (V)"
-            self.state.transformed_map["y_name"] = "Efield (V)"
+            self.state.transformed_map["x_name"] = x_label
+            self.state.transformed_map["y_name"] = y_label
             self.state.transformed_map["z_name"] = "PL Intensity"
             self._dirty_views["intensity_transformed"] = False
             cmap = self.map_cmap_combo.currentText()
             ratio = result.get("ratio", self.ratio_spin.value())
             fig, _ = plot_map(
                 result["X2D"], result["Y2D"], result["Z2D"],
-                x_label="Doping (V)", y_label="Efield (V)",
+                x_label=x_label, y_label=y_label,
                 z_label="PL Intensity (a.u.)",
-                title=f"PL Intensity | Doping/Efield (ratio={ratio:.2f})",
+                title=f"PL Intensity | Transformed (ratio={ratio:.4g})",
                 cmap=cmap,
             )
             self.state.figures["transformed_map"] = fig
@@ -2361,9 +2424,10 @@ class MainWindow(QMainWindow):
         try:
             axes = result.get("target_axes", "original")
             if axes == "transformed":
+                x_label, y_label = self._axis_labels()
                 self.state.peak_map_transformed = result
-                self.state.peak_map_transformed["x_name"] = "Doping (V)"
-                self.state.peak_map_transformed["y_name"] = "Efield (V)"
+                self.state.peak_map_transformed["x_name"] = x_label
+                self.state.peak_map_transformed["y_name"] = y_label
                 self.state.peak_map_transformed["z_name"] = "Peak Energy"
                 self._dirty_views["peak_transformed"] = False
                 figure_key = "peak_map_transformed"

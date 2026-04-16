@@ -20,6 +20,7 @@ class AppState:
     unique_x_count: int = 0
     unique_y_count: int = 0
     current_ratio: float = 1.0
+    transform_convention: str = "TG+rBG"  # "TG+rBG": D=TG+r·BG  |  "rTG+BG": D=r·TG+BG
 
     data: dict[str, Any] | None = None
 
