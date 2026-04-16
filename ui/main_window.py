@@ -901,12 +901,12 @@ class MainWindow(QMainWindow):
         self.sg_window_spin = QSpinBox()
         self.sg_window_spin.setRange(3, 501)
         self.sg_window_spin.setSingleStep(2)
-        self.sg_window_spin.setValue(25)
+        self.sg_window_spin.setValue(31)
         self.sg_window_spin.valueChanged.connect(self._on_peak_settings_changed)
 
         self.sg_poly_spin = QSpinBox()
         self.sg_poly_spin.setRange(0, 10)
-        self.sg_poly_spin.setValue(1)
+        self.sg_poly_spin.setValue(3)
         self.sg_poly_spin.valueChanged.connect(self._on_peak_settings_changed)
 
         # RC preview spinboxes (separate rows so they fit the sidebar width)
@@ -1061,12 +1061,12 @@ class MainWindow(QMainWindow):
         self.sg_window_spin = QSpinBox()
         self.sg_window_spin.setRange(3, 501)
         self.sg_window_spin.setSingleStep(2)
-        self.sg_window_spin.setValue(25)
+        self.sg_window_spin.setValue(31)
         self.sg_window_spin.valueChanged.connect(self._on_peak_settings_changed)
 
         self.sg_poly_spin = QSpinBox()
         self.sg_poly_spin.setRange(0, 10)
-        self.sg_poly_spin.setValue(1)
+        self.sg_poly_spin.setValue(3)
         self.sg_poly_spin.valueChanged.connect(self._on_peak_settings_changed)
 
         self.peak_axes_combo = QComboBox()

@@ -213,7 +213,21 @@ def sum_select_region(Intensity, energy, min_energy, max_energy, baseline=595):
     return result
 
 
-def compute_peak_energy(Intensity, energy, sg_window=25, sg_poly=1):
+def _normalize_sg_params(npts: int, sg_window: int, sg_poly: int) -> tuple[int, int]:
+    """Clamp SG settings to valid values for the available point count."""
+    if npts < 3:
+        raise ValueError("At least 3 points are required for Savitzky-Golay smoothing.")
+
+    win = min(sg_window, npts if npts % 2 == 1 else npts - 1)
+    if win < 3:
+        win = 3 if npts >= 3 else npts
+    if win % 2 == 0:
+        win -= 1
+    poly = max(0, min(sg_poly, win - 1))
+    return win, poly
+
+
+def compute_peak_energy(Intensity, energy, sg_window=31, sg_poly=3):
     """
     Find the energy of peak PL intensity for each spectrum, with
     Savitzky-Golay smoothing.
@@ -230,13 +244,7 @@ def compute_peak_energy(Intensity, energy, sg_window=25, sg_poly=1):
     (N,) array of peak energies in eV
     """
     npts = Intensity.shape[1]
-    # ensure odd window, capped at npts
-    win = min(sg_window, npts if npts % 2 == 1 else npts - 1)
-    if win < 3:
-        win = 3 if npts >= 3 else npts
-    if win % 2 == 0:
-        win -= 1
-    poly = min(sg_poly, win - 1)
+    win, poly = _normalize_sg_params(npts, sg_window, sg_poly)
 
     Yf = savgol_filter(Intensity, window_length=win, polyorder=poly, axis=1, mode='interp')
     Yf_safe = np.where(np.isfinite(Yf), Yf, -np.inf)
@@ -377,7 +385,7 @@ def compute_intensity_map(data, min_energy, max_energy, baseline=595):
     )
 
 
-def compute_peak_energy_map(data, sg_window=25, sg_poly=1):
+def compute_peak_energy_map(data, sg_window=31, sg_poly=3):
     """
     Compute peak-energy map from loaded data dict.
 
@@ -433,8 +441,14 @@ def compute_rc_peak_to_peak_map(rc_spectra: np.ndarray, energy: np.ndarray,
     return np.nanmax(window, axis=1) - np.nanmin(window, axis=1)
 
 
-def compute_rc_peak_position(energy: np.ndarray, rc_spectrum: np.ndarray,
-                             e_lo: float, e_hi: float) -> tuple[float, float]:
+def compute_rc_peak_position(
+    energy: np.ndarray,
+    rc_spectrum: np.ndarray,
+    e_lo: float,
+    e_hi: float,
+    sg_window: int = 31,
+    sg_poly: int = 3,
+) -> tuple[float, float]:
     """
     Find the dominant RC feature position within [e_lo, e_hi].
 
@@ -460,14 +474,12 @@ def compute_rc_peak_position(energy: np.ndarray, rc_spectrum: np.ndarray,
     if n_points < 3:
         return np.nan, np.nan
 
-    window_length = min(n_points if n_points % 2 == 1 else n_points - 1, 21)
-    window_length = max(5, window_length)
-    if window_length >= n_points:
-        window_length = n_points if n_points % 2 == 1 else n_points - 1
-    if window_length < 3:
+    try:
+        window_length, polyorder = _normalize_sg_params(n_points, sg_window, sg_poly)
+    except ValueError:
         return np.nan, np.nan
 
-    yw_smooth = savgol_filter(yw, window_length=window_length, polyorder=2, mode="interp")
+    yw_smooth = savgol_filter(yw, window_length=window_length, polyorder=polyorder, mode="interp")
 
     def _best_feature(invert: bool = False):
         target = -yw_smooth if invert else yw_smooth
@@ -505,13 +517,26 @@ def compute_rc_peak_position(energy: np.ndarray, rc_spectrum: np.ndarray,
     return np.nan, np.nan
 
 
-def compute_rc_peak_position_map(rc_spectra: np.ndarray, energy: np.ndarray,
-                                 e_lo: float, e_hi: float) -> np.ndarray:
+def compute_rc_peak_position_map(
+    rc_spectra: np.ndarray,
+    energy: np.ndarray,
+    e_lo: float,
+    e_hi: float,
+    sg_window: int = 31,
+    sg_poly: int = 3,
+) -> np.ndarray:
     """Compute the dominant RC feature position for each sweep point."""
     rc_matrix = np.asarray(rc_spectra, dtype=float)
     positions = np.full(rc_matrix.shape[0], np.nan, dtype=float)
     for index, spectrum in enumerate(rc_matrix):
-        positions[index], _ = compute_rc_peak_position(energy, spectrum, e_lo, e_hi)
+        positions[index], _ = compute_rc_peak_position(
+            energy,
+            spectrum,
+            e_lo,
+            e_hi,
+            sg_window=sg_window,
+            sg_poly=sg_poly,
+        )
     return positions
 
 

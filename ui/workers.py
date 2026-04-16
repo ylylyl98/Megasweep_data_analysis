@@ -253,6 +253,8 @@ class AnalysisRefreshWorker(BaseWorker):
                     self.data['energy'],
                     self.min_energy,
                     self.max_energy,
+                    self.sg_window,
+                    self.sg_poly,
                 )
             else:
                 self.log.emit("Computing peak-energy map...")

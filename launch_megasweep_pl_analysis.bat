@@ -94,7 +94,7 @@ call "%ACTIVATE_BAT%"
 if errorlevel 1 (
     echo.
     echo [ERROR] Failed to activate .venv.
-    echo         Rebuild the environment by deleting .venv and running launch.bat again.
+    echo         Rebuild the environment by deleting .venv and running %~nx0 again.
     goto error_exit
 )
 

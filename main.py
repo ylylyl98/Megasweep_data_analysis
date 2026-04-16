@@ -5,10 +5,11 @@ Entry point for the Megasweep PL Analysis desktop app.
 
 Launch:
     python main.py
-or double-click launch.bat
+or double-click launch_megasweep_pl_analysis.bat
 """
 
 from datetime import datetime
+import ctypes
 import os
 import sys
 import traceback
@@ -30,6 +31,8 @@ if APP_DIR not in sys.path:
 
 
 _CRASH_LOG_PATH = os.path.join(APP_DIR, "megasweep_crash.log")
+APP_ID = "YanLab.MegasweepAnalysis"
+APP_NAME = "Megasweep PL Analysis"
 
 
 def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
@@ -58,6 +61,16 @@ sys.excepthook = _log_uncaught_exception
 from ui.main_window import MainWindow
 
 
+def _apply_windows_app_id(app_id: str) -> None:
+    """Give the process a stable Windows taskbar identity when supported."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+
+
 def _light_palette() -> QPalette:
     """Return a light, modern-looking application palette."""
     pal = QPalette()
@@ -78,8 +91,11 @@ def _light_palette() -> QPalette:
 
 
 def main():
+    _apply_windows_app_id(APP_ID)
+
     app = QApplication(sys.argv)
-    app.setApplicationName("Megasweep PL Analysis")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setStyle("Fusion")
     app.setPalette(_light_palette())
 
