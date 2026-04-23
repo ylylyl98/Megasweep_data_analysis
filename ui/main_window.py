@@ -616,7 +616,10 @@ class MainWindow(QMainWindow):
         *,
         ratio: float | None = None,
     ) -> None:
-        mapping = f"TG={self.state.selected_tg_col or 'Y'} (Y), BG={self.state.selected_bg_col or 'X'} (X)"
+        mapping = (
+            f"Sweep X={self.state.selected_x_col or 'X'}, "
+            f"Sweep Y={self.state.selected_y_col or 'Y'}"
+        )
         summary = (
             f"{stage_name} payload: X{np.shape(payload['X2D'])}, Y{np.shape(payload['Y2D'])}, "
             f"Z{np.shape(payload['Z2D'])}"
@@ -833,10 +836,12 @@ class MainWindow(QMainWindow):
 
         self.vbg_combo = QComboBox()
         self.vtg_combo = QComboBox()
+        self._sweep_x_label = QLabel("Sweep X column:")
+        self._sweep_y_label = QLabel("Sweep Y column:")
         self.vbg_combo.currentTextChanged.connect(self._on_gate_columns_changed)
         self.vtg_combo.currentTextChanged.connect(self._on_gate_columns_changed)
-        form.addRow("Vbg column:", self.vbg_combo)
-        form.addRow("Vtg column:", self.vtg_combo)
+        form.addRow(self._sweep_x_label, self.vbg_combo)
+        form.addRow(self._sweep_y_label, self.vtg_combo)
 
         self.load_csv_btn = QPushButton("Load CSV")
         self.load_csv_btn.clicked.connect(self._start_csv_load)
@@ -913,7 +918,7 @@ class MainWindow(QMainWindow):
         self.preview_rc_btn.clicked.connect(self._preview_reflection_spectra)
 
         self.reflection_preview_status_label = QLabel(
-            "Load CSV + background, then preview an RC spectrum at the chosen Vbg/Vtg."
+            "Load CSV + background, then preview an RC spectrum at the chosen sweep coordinates."
         )
         self.reflection_preview_status_label.setWordWrap(True)
         self.reflection_preview_status_label.setStyleSheet("color:#5a7088;")
@@ -946,10 +951,10 @@ class MainWindow(QMainWindow):
         form.addRow("", self.formula_label)
 
         # --- RC-specific rows (shown only when mode == "Reflection") ---
-        self._rc_vbg_label = QLabel("Preview Vbg:")
+        self._rc_vbg_label = QLabel("Preview X:")
         form.addRow(self._rc_vbg_label, self.reflection_preview_vbg_spin)
 
-        self._rc_vtg_label = QLabel("Preview Vtg:")
+        self._rc_vtg_label = QLabel("Preview Y:")
         form.addRow(self._rc_vtg_label, self.reflection_preview_vtg_spin)
 
         self._rc_btn_placeholder = QLabel("")
@@ -1433,6 +1438,7 @@ class MainWindow(QMainWindow):
         if vtg_guess:
             self.vtg_combo.setCurrentText(vtg_guess)
         self._building_combos = False
+        self._update_axis_ui_text()
 
         self.state.header_columns = columns
         self.state.gate_columns = gate_columns
@@ -1441,8 +1447,8 @@ class MainWindow(QMainWindow):
             self._on_output_dir_changed()
 
         self._append_log(
-            f"Headers detected. Auto-selected Vbg={self.vbg_combo.currentText()} and "
-            f"Vtg={self.vtg_combo.currentText()}.",
+            f"Headers detected. Auto-selected Sweep X={self.vbg_combo.currentText()} and "
+            f"Sweep Y={self.vtg_combo.currentText()}.",
             "info",
         )
 
@@ -1553,9 +1559,34 @@ class MainWindow(QMainWindow):
 
     # (legacy method removed – use _preview_reflection_spectra instead)
 
+    def _update_axis_ui_text(self) -> None:
+        x_name = self.vbg_combo.currentText().strip() or self.state.selected_x_col or "X"
+        y_name = self.vtg_combo.currentText().strip() or self.state.selected_y_col or "Y"
+
+        self._sweep_x_label.setText(f"Sweep X column ({x_name}):")
+        self._sweep_y_label.setText(f"Sweep Y column ({y_name}):")
+        self._rc_vbg_label.setText(f"Preview {x_name}:")
+        self._rc_vtg_label.setText(f"Preview {y_name}:")
+
+        axis_space = None
+        if self.state.data is not None:
+            axis_space = self.state.data.get("axis_space")
+        else:
+            names = [x_name.lower().replace("_", "").replace(" ", ""), y_name.lower().replace("_", "").replace(" ", "")]
+            if any(any(token in name for token in ("doping", "density", "efield", "electricfield", "field")) for name in names):
+                axis_space = "transformed"
+            else:
+                axis_space = "gate"
+
+        mode_text = "Loaded axes: D/E" if axis_space == "transformed" else "Loaded axes: gate sweep"
+        current_summary = self.summary_label.text().strip() if hasattr(self, "summary_label") else ""
+        if not current_summary or current_summary == "No CSV loaded." or current_summary.startswith("Sweep selection:"):
+            self.summary_label.setText(f"Sweep selection: X={x_name}, Y={y_name} | {mode_text}")
+
     def _on_gate_columns_changed(self) -> None:
         if self._building_combos:
             return
+        self._update_axis_ui_text()
         if self.state.data is not None:
             self._invalidate_from_stage(1, "Gate-column selection changed. Cached analysis results were cleared.")
 
@@ -1577,21 +1608,21 @@ class MainWindow(QMainWindow):
             x_data = np.asarray(self.state.data["x_data"], dtype=float).reshape(-1)
             y_data = np.asarray(self.state.data["y_data"], dtype=float).reshape(-1)
             energy = np.asarray(self.state.data["energy"], dtype=float).reshape(-1)
-            target_vbg = float(self.reflection_preview_vbg_spin.value())
-            target_vtg = float(self.reflection_preview_vtg_spin.value())
+            target_x = float(self.reflection_preview_vbg_spin.value())
+            target_y = float(self.reflection_preview_vtg_spin.value())
 
             if x_data.size == 0 or y_data.size == 0 or rc_spectra.shape[0] == 0:
                 raise ValueError("No reflection points are available for RC preview.")
 
             finite_mask = np.isfinite(x_data) & np.isfinite(y_data)
             if not np.any(finite_mask):
-                raise ValueError("Reflection dataset does not contain any finite Vbg/Vtg points.")
+                raise ValueError("Reflection dataset does not contain any finite sweep-coordinate points.")
 
             finite_indices = np.flatnonzero(finite_mask)
-            distances = (x_data[finite_mask] - target_vbg) ** 2 + (y_data[finite_mask] - target_vtg) ** 2
+            distances = (x_data[finite_mask] - target_x) ** 2 + (y_data[finite_mask] - target_y) ** 2
             row_index = int(finite_indices[int(np.argmin(distances))])
-            actual_vbg = float(x_data[row_index])
-            actual_vtg = float(y_data[row_index])
+            actual_x = float(x_data[row_index])
+            actual_y = float(y_data[row_index])
             spectrum = np.asarray(rc_spectra[row_index], dtype=float).reshape(-1)
         except Exception:
             self._append_log(traceback.format_exc(), "error")
@@ -1663,7 +1694,9 @@ class MainWindow(QMainWindow):
 
         ax.set_xlabel("Energy (eV)")
         ax.set_ylabel("RC (ΔI/I₀)")
-        ax.set_title(f"RC spectrum  Vbg = {actual_vbg:.3f} V,  Vtg = {actual_vtg:.3f} V")
+        x_label = self.state.data.get("x_name", "X")
+        y_label = self.state.data.get("y_name", "Y")
+        ax.set_title(f"RC spectrum  {x_label} = {actual_x:.3f},  {y_label} = {actual_y:.3f}")
         ax.legend(loc="best", fontsize=8)
         fig.tight_layout()
 
@@ -1673,7 +1706,7 @@ class MainWindow(QMainWindow):
         p2p_str = f"{rc_p2p:.4f}" if np.isfinite(rc_p2p) else "n/a"
         pk_str = f"{pk_energy:.4f} eV" if np.isfinite(pk_energy) else "n/a"
         self._reflection_preview_message = (
-            f"RC preview: Vbg={actual_vbg:.3f} V, Vtg={actual_vtg:.3f} V | "
+            f"RC preview: {x_label}={actual_x:.3f}, {y_label}={actual_y:.3f} | "
             f"P2P={p2p_str} | Peak={pk_str}"
         )
         self.reflection_preview_status_label.setText(self._reflection_preview_message)
@@ -1817,6 +1850,11 @@ class MainWindow(QMainWindow):
                     return column
             return ""
 
+        transformed_x = pick(["doping", "density", "carrierdensity"])
+        transformed_y = pick(["efield", "electricfield", "field"], exclude=transformed_x)
+        if transformed_x and transformed_y:
+            return transformed_y, transformed_x
+
         vtg = pick(["vtg", "tg", "topgate", "vg1", "gate1"])
         vbg = pick(["vbg", "bg", "backgate", "bottomgate", "vg2", "gate2"], exclude=vtg)
         if not vbg:
@@ -1871,17 +1909,17 @@ class MainWindow(QMainWindow):
         vbg = self.vbg_combo.currentText()
         vtg = self.vtg_combo.currentText()
         if not vbg or not vtg:
-            self._append_log("Select both Vbg and Vtg columns before loading.", "error")
+            self._append_log("Select both sweep-axis columns before loading.", "error")
             return
 
         self.state.csv_path = csv_path
         csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
         self.state.output_dir = os.path.join(os.path.dirname(csv_path), f"{csv_stem}_outputs")
         self.out_edit.setText(self.state.output_dir)
-        self.state.selected_bg_col = vbg
-        self.state.selected_tg_col = vtg
         self.state.selected_x_col = vbg
         self.state.selected_y_col = vtg
+        self.state.selected_bg_col = vbg
+        self.state.selected_tg_col = vtg
 
         worker = CsvLoadWorker(csv_path, x_col=vbg, y_col=vtg)
         self._run_worker(worker, self._on_csv_loaded, context="Loading CSV")
@@ -1964,8 +2002,21 @@ class MainWindow(QMainWindow):
         epsilon = self.batch_epsilon_spin.value()
         convention = self._current_convention()
         try:
-            n_doping = len(find_all_cut_values(x, y, "doping", ratio, epsilon, convention=convention))
-            n_efield = len(find_all_cut_values(x, y, "efield", ratio, epsilon, convention=convention))
+            axis_space = data.get("axis_space", "gate")
+            n_doping = len(find_all_cut_values(
+                x, y, "doping", ratio, epsilon,
+                convention=convention,
+                axis_space=axis_space,
+                x_axis_name=data.get("x_name", ""),
+                y_axis_name=data.get("y_name", ""),
+            ))
+            n_efield = len(find_all_cut_values(
+                x, y, "efield", ratio, epsilon,
+                convention=convention,
+                axis_space=axis_space,
+                x_axis_name=data.get("x_name", ""),
+                y_axis_name=data.get("y_name", ""),
+            ))
         except Exception as exc:
             self.batch_preview_label.setText(f"Preview error: {exc}")
             return
@@ -2205,11 +2256,18 @@ class MainWindow(QMainWindow):
 
                     elif map_key == "transformed_map":
                         self.state.transformed_map = map_data
-                        x_name, y_name = self._axis_labels()
+                        if self.state.data.get("axis_space") == "transformed":
+                            x_name = self.state.data.get("x_name", "doping")
+                            y_name = self.state.data.get("y_name", "efield")
+                        else:
+                            x_name, y_name = self._axis_labels()
                         z_name = "RC Peak-to-Peak" if is_rc else "PL Intensity"
                         z_label = "RC Amplitude (a.u.)" if is_rc else "PL Intensity (a.u.)"
                         ratio = map_data.get("ratio", self.ratio_spin.value())
-                        title = f"{z_name} Map | Transformed (ratio={ratio:.4g}){e_suffix}"
+                        if self.state.data.get("axis_space") == "transformed":
+                            title = f"{z_name} Map | Loaded transformed axes{e_suffix}"
+                        else:
+                            title = f"{z_name} Map | Transformed (ratio={ratio:.4g}){e_suffix}"
                         self._dirty_views["intensity_transformed"] = False
                         figure_key = "transformed_map"
 
@@ -2226,11 +2284,18 @@ class MainWindow(QMainWindow):
 
                     elif map_key == "peak_map_transformed":
                         self.state.peak_map_transformed = map_data
-                        x_name, y_name = self._axis_labels()
+                        if self.state.data.get("axis_space") == "transformed":
+                            x_name = self.state.data.get("x_name", "doping")
+                            y_name = self.state.data.get("y_name", "efield")
+                        else:
+                            x_name, y_name = self._axis_labels()
                         z_name = "RC Peak Position" if is_rc else "Peak Energy"
                         z_label = "RC Peak Position (eV)" if is_rc else "Peak Energy (eV)"
                         ratio = map_data.get("ratio", self.ratio_spin.value())
-                        title = f"{z_name} Map | Transformed (ratio={ratio:.4g}){e_suffix}"
+                        if self.state.data.get("axis_space") == "transformed":
+                            title = f"{z_name} Map | Loaded transformed axes{e_suffix}"
+                        else:
+                            title = f"{z_name} Map | Transformed (ratio={ratio:.4g}){e_suffix}"
                         self._dirty_views["peak_transformed"] = False
                         figure_key = "peak_map_transformed"
 
@@ -2399,19 +2464,25 @@ class MainWindow(QMainWindow):
 
     def _on_transform_ready(self, result: dict) -> None:
         try:
-            x_label, y_label = self._axis_labels()
+            if self.state.data.get("axis_space") == "transformed":
+                x_label = self.state.data.get("x_name", "doping")
+                y_label = self.state.data.get("y_name", "efield")
+                title = "PL Intensity | Loaded transformed axes"
+            else:
+                x_label, y_label = self._axis_labels()
+                ratio = result.get("ratio", self.ratio_spin.value())
+                title = f"PL Intensity | Transformed (ratio={ratio:.4g})"
             self.state.transformed_map = result
             self.state.transformed_map["x_name"] = x_label
             self.state.transformed_map["y_name"] = y_label
             self.state.transformed_map["z_name"] = "PL Intensity"
             self._dirty_views["intensity_transformed"] = False
             cmap = self.map_cmap_combo.currentText()
-            ratio = result.get("ratio", self.ratio_spin.value())
             fig, _ = plot_map(
                 result["X2D"], result["Y2D"], result["Z2D"],
                 x_label=x_label, y_label=y_label,
                 z_label="PL Intensity (a.u.)",
-                title=f"PL Intensity | Transformed (ratio={ratio:.4g})",
+                title=title,
                 cmap=cmap,
             )
             self.state.figures["transformed_map"] = fig
@@ -2424,7 +2495,13 @@ class MainWindow(QMainWindow):
         try:
             axes = result.get("target_axes", "original")
             if axes == "transformed":
-                x_label, y_label = self._axis_labels()
+                if self.state.data.get("axis_space") == "transformed":
+                    x_label = self.state.data.get("x_name", "doping")
+                    y_label = self.state.data.get("y_name", "efield")
+                    title = "Peak Energy Map (loaded transformed axes)"
+                else:
+                    x_label, y_label = self._axis_labels()
+                    title = f"Peak Energy Map ({axes} axes)"
                 self.state.peak_map_transformed = result
                 self.state.peak_map_transformed["x_name"] = x_label
                 self.state.peak_map_transformed["y_name"] = y_label
@@ -2438,13 +2515,14 @@ class MainWindow(QMainWindow):
                 self.state.peak_map_original["z_name"] = "Peak Energy"
                 self._dirty_views["peak_original"] = False
                 figure_key = "peak_map_original"
+                title = f"Peak Energy Map ({axes} axes)"
             cmap = self.map_cmap_combo.currentText()
             fig, _ = plot_map(
                 result["X2D"], result["Y2D"], result["Z2D"],
                 x_label=result.get("x_name", "x"),
                 y_label=result.get("y_name", "y"),
                 z_label="Peak Energy (eV)",
-                title=f"Peak Energy Map ({axes} axes)",
+                title=title,
                 cmap=cmap,
             )
             self.state.figures[figure_key] = fig

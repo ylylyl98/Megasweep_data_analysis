@@ -23,6 +23,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
 from matplotlib.figure import Figure
 from scipy import optimize
 from scipy.signal import find_peaks, savgol_filter, medfilt2d
@@ -86,6 +87,18 @@ def _split_numeric_spectral_columns(columns, excluded=None):
         else:
             spectral_cols.append(column)
     return metadata_cols, spectral_cols
+
+
+def _infer_axis_space(x_name, y_name):
+    """Classify whether the selected axes are raw gate axes or transformed axes."""
+    labels = [
+        str(x_name).lower().replace("_", "").replace(" ", ""),
+        str(y_name).lower().replace("_", "").replace(" ", ""),
+    ]
+    transformed_tokens = ("doping", "density", "efield", "electricfield", "field")
+    if any(any(token in label for token in transformed_tokens) for label in labels):
+        return "transformed"
+    return "gate"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +184,7 @@ def load_megasweep_csv(csv_path, x_col=None, y_col=None):
         'df': df,
         'x_name': x_col,
         'y_name': y_col,
+        'axis_space': _infer_axis_space(x_col, y_col),
         'x_data': x_data,
         'y_data': y_data,
         'wavelength': wavelength,
@@ -336,24 +350,77 @@ def build_grid(x_data, y_data, quantity_flat):
     idx_flat : sorting index (for reuse when gridding multiple quantities)
     n_x, n_y : grid dimensions
     """
-    n_x = len(np.unique(x_data))
-    n_y = len(np.unique(y_data))
+    x_vals = np.asarray(x_data, dtype=float).reshape(-1)
+    y_vals = np.asarray(y_data, dtype=float).reshape(-1)
+    z_vals = np.asarray(quantity_flat, dtype=float).reshape(-1)
+    if not (x_vals.size == y_vals.size == z_vals.size):
+        raise ValueError("x_data, y_data, and quantity_flat must have the same length.")
 
-    if n_x * n_y != len(x_data):
-        # Grid is not perfectly rectangular — warn and use closest estimate
-        import warnings
-        warnings.warn(
-            f"Data length ({len(x_data)}) ≠ n_x×n_y ({n_x}×{n_y}={n_x*n_y}). "
-            "Grid may be incomplete. Results may look wrong near edges."
+    n_x = len(np.unique(x_vals))
+    n_y = len(np.unique(y_vals))
+    pair_count = len({(float(x), float(y)) for x, y in zip(x_vals, y_vals)})
+    expected = n_x * n_y
+    if expected != x_vals.size or pair_count != x_vals.size:
+        raise ValueError(
+            "Selected map axes do not form a rectangular sweep grid. "
+            f"Got {x_vals.size} points, {n_x} unique x values, {n_y} unique y values, "
+            f"and {pair_count} unique coordinate pairs. Choose the true sweep axes or "
+            "use the irregular-map fallback."
         )
 
     # Sort: primary key = x (rows), secondary key = y (cols)
-    idx_flat = np.lexsort((y_data, x_data))
-    X2D = x_data[idx_flat].reshape(n_x, n_y)
-    Y2D = y_data[idx_flat].reshape(n_x, n_y)
-    Z2D = quantity_flat[idx_flat].reshape(n_x, n_y)
+    idx_flat = np.lexsort((y_vals, x_vals))
+    X2D = x_vals[idx_flat].reshape(n_x, n_y)
+    Y2D = y_vals[idx_flat].reshape(n_x, n_y)
+    Z2D = z_vals[idx_flat].reshape(n_x, n_y)
 
     return X2D, Y2D, Z2D, idx_flat, n_x, n_y
+
+
+def build_map_payload(x_data, y_data, quantity_flat):
+    """
+    Return a common map payload for both regular grids and irregular point clouds.
+
+    For regular data, X2D/Y2D/Z2D are 2-D arrays. For irregular data, they are
+    1-D sorted arrays suitable for scatter/triangulated plotting.
+    """
+    x_vals = np.asarray(x_data, dtype=float).reshape(-1)
+    y_vals = np.asarray(y_data, dtype=float).reshape(-1)
+    z_vals = np.asarray(quantity_flat, dtype=float).reshape(-1)
+    if not (x_vals.size == y_vals.size == z_vals.size):
+        raise ValueError("x_data, y_data, and quantity_flat must have the same length.")
+
+    idx_flat = np.lexsort((y_vals, x_vals))
+    x_sorted = x_vals[idx_flat]
+    y_sorted = y_vals[idx_flat]
+    z_sorted = z_vals[idx_flat]
+    n_x = len(np.unique(x_vals))
+    n_y = len(np.unique(y_vals))
+    pair_count = len({(float(x), float(y)) for x, y in zip(x_vals, y_vals)})
+    is_grid = bool(n_x * n_y == x_vals.size and pair_count == x_vals.size)
+
+    if is_grid:
+        X2D = x_sorted.reshape(n_x, n_y)
+        Y2D = y_sorted.reshape(n_x, n_y)
+        Z2D = z_sorted.reshape(n_x, n_y)
+    else:
+        X2D = x_sorted
+        Y2D = y_sorted
+        Z2D = z_sorted
+
+    return {
+        "flat": z_vals,
+        "x_flat": x_sorted,
+        "y_flat": y_sorted,
+        "z_flat": z_sorted,
+        "X2D": X2D,
+        "Y2D": Y2D,
+        "Z2D": Z2D,
+        "idx_flat": idx_flat,
+        "n_x": n_x,
+        "n_y": n_y,
+        "is_grid": is_grid,
+    }
 
 
 def build_grid_multi(x_data, y_data, *quantities):
@@ -581,89 +648,94 @@ def compute_transformed_coords(X2D, Y2D, ratio, tg_is_y=True, convention="TG+rBG
 # 7.  Line cuts
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _transformed_axis_arrays(x_data, y_data, x_axis_name='', y_axis_name=''):
+    """Return (doping_array, efield_array) from already-transformed loaded axes."""
+    x_vals = np.asarray(x_data, dtype=float)
+    y_vals = np.asarray(y_data, dtype=float)
+    x_name = str(x_axis_name).lower().replace('_', '').replace(' ', '')
+    y_name = str(y_axis_name).lower().replace('_', '').replace(' ', '')
+
+    x_is_doping = any(token in x_name for token in ('doping', 'density', 'carrierdensity'))
+    y_is_doping = any(token in y_name for token in ('doping', 'density', 'carrierdensity'))
+    x_is_efield = any(token in x_name for token in ('efield', 'electricfield', 'field'))
+    y_is_efield = any(token in y_name for token in ('efield', 'electricfield', 'field'))
+
+    if x_is_doping and y_is_efield:
+        return x_vals, y_vals
+    if x_is_efield and y_is_doping:
+        return y_vals, x_vals
+    return x_vals, y_vals
+
+
+
 def extract_line_cut(raw_data, x_data, y_data, energy,
                      cut_type='doping', c_value=0.0,
                      ratio=0.9, epsilon=0.03,
-                     tg_is_y=True, convention='TG+rBG'):
+                     tg_is_y=True, convention='TG+rBG',
+                     axis_space='gate',
+                     x_axis_name='', y_axis_name=''):
     """
     Extract a line cut at a constant value of a transformed coordinate.
 
-    Parameters
-    ----------
-    raw_data   : (N, 2+n_wl) array  [x, y, spectrum…]
-    x_data, y_data : (N,) arrays
-    energy     : (n_wl,) array in eV
-    cut_type   : 'doping' or 'efield'
-    c_value    : float, the constant value to cut along
-    ratio      : float, lever-arm ratio r
-    epsilon    : float, half-width of the acceptance window around c_value.
-                 Only data points where |value - c_value| <= epsilon are
-                 included.  No nearest-neighbour approximation is performed;
-                 if no points fall within the window the returned arrays are
-                 empty.
-    tg_is_y   : bool, if True TG=y_data, BG=x_data; else reversed
-    convention : 'TG+rBG'  →  D = TG + r·BG,  E = TG - r·BG
-                 'rTG+BG'  →  D = r·TG + BG,   E = r·TG - BG
-
-    Returns
-    -------
-    dict with keys: axis_values, axis_label, spectra, energy,
-                    x_sel, y_sel, cut_type, c_value_used, ratio
+    When ``axis_space == 'transformed'``, x_data/y_data are treated as the
+    already-loaded doping/efield coordinates directly.
     """
-    if tg_is_y:
-        TG, BG = y_data, x_data
+    if axis_space == 'transformed':
+        D, E = _transformed_axis_arrays(x_data, y_data, x_axis_name=x_axis_name, y_axis_name=y_axis_name)
+        d_label = 'Doping (V)'
+        e_label = 'Efield (V)'
     else:
-        TG, BG = x_data, y_data
+        if tg_is_y:
+            TG, BG = y_data, x_data
+        else:
+            TG, BG = x_data, y_data
 
-    r = ratio
-    if convention == 'TG+rBG':
-        D = TG + r * BG
-        E = TG - r * BG
-        d_label = f'TG + {r}·BG (V)'
-        e_label = f'TG − {r}·BG (V)'
-    elif convention == 'rTG+BG':
-        D = r * TG + BG
-        E = r * TG - BG
-        d_label = f'{r}·TG + BG (V)'
-        e_label = f'{r}·TG − BG (V)'
-    else:
-        raise ValueError(f"Unknown convention: {convention!r}")
+        r = ratio
+        if convention == 'TG+rBG':
+            D = TG + r * BG
+            E = TG - r * BG
+            d_label = f'TG + {r}?BG (V)'
+            e_label = f'TG ? {r}?BG (V)'
+        elif convention == 'rTG+BG':
+            D = r * TG + BG
+            E = r * TG - BG
+            d_label = f'{r}?TG + BG (V)'
+            e_label = f'{r}?TG ? BG (V)'
+        else:
+            raise ValueError(f"Unknown convention: {convention!r}")
 
     if cut_type == 'doping':
         line_values = D
         vary_values = E
-        vary_label  = f'E = {e_label}'
+        vary_label = f'E = {e_label}'
     elif cut_type == 'efield':
         line_values = E
         vary_values = D
-        vary_label  = f'D = {d_label}'
+        vary_label = f'D = {d_label}'
     else:
         raise ValueError(f"Unknown cut_type: {cut_type!r}. Use 'doping' or 'efield'.")
 
-    # Round to 9 d.p. to eliminate floating-point noise before matching.
-    # This must agree with find_all_cut_values which also rounds to 9 d.p.
     line_values = np.round(line_values, 9)
+    vary_values = np.asarray(vary_values, dtype=float)
     c_value = round(c_value, 9)
 
     dist = np.abs(line_values - c_value)
-    mask = dist <= epsilon
-    sel_idx = np.where(mask)[0]
+    sel_idx = np.where(dist <= epsilon)[0]
 
     if sel_idx.size == 0:
         empty = np.empty(0, dtype=float)
         return {
             'axis_values': empty,
-            'axis_label':  vary_label,
-            'spectra':     np.empty((0, raw_data.shape[1] - 2), dtype=float),
-            'energy':      energy,
-            'x_sel':       empty,
-            'y_sel':       empty,
-            'cut_type':    cut_type,
+            'axis_label': vary_label,
+            'spectra': np.empty((0, raw_data.shape[1] - 2), dtype=float),
+            'energy': energy,
+            'x_sel': empty,
+            'y_sel': empty,
+            'cut_type': cut_type,
             'c_value_used': c_value,
-            'ratio':       ratio,
+            'ratio': ratio,
         }
 
-    # De-duplicate: for each unique vary_value bucket keep the point closest to c_value
     unique_vary = np.unique(np.round(vary_values[sel_idx], 9))
     keep = []
     for uv in unique_vary:
@@ -675,41 +747,25 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
     keep = keep[np.argsort(vary_values[keep])]
 
     return {
-        'axis_values':  vary_values[keep],
-        'axis_label':   vary_label,
-        'spectra':      raw_data[keep, 2:],
-        'energy':       energy,
-        'x_sel':        x_data[keep],
-        'y_sel':        y_data[keep],
-        'cut_type':     cut_type,
+        'axis_values': vary_values[keep],
+        'axis_label': vary_label,
+        'spectra': raw_data[keep, 2:],
+        'energy': energy,
+        'x_sel': np.asarray(x_data, dtype=float)[keep],
+        'y_sel': np.asarray(y_data, dtype=float)[keep],
+        'cut_type': cut_type,
         'c_value_used': c_value,
-        'ratio':        ratio,
+        'ratio': ratio,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8.  Plotting
-# ─────────────────────────────────────────────────────────────────────────────
 
 def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
-                        min_points=2, tg_is_y=True, convention='TG+rBG'):
+                        min_points=2, tg_is_y=True, convention='TG+rBG',
+                        axis_space='gate',
+                        x_axis_name='', y_axis_name=''):
     """
     Find representative constant-axis values for batch line-cut extraction.
-
-    Parameters
-    ----------
-    x_data, y_data : (N,) arrays
-    cut_type       : 'doping' or 'efield'
-    ratio          : float, lever-arm ratio
-    epsilon        : float, half-width tolerance used by extract_line_cut
-    min_points     : int, minimum points required to keep a cut
-    tg_is_y        : bool, if True TG=y_data and BG=x_data
-    convention     : 'TG+rBG' or 'rTG+BG' — controls the D/E formula
-
-    Returns
-    -------
-    list of float
-        Sorted representative cut centers suitable for extract_line_cut().
     """
     if epsilon < 0:
         raise ValueError("epsilon must be zero or positive.")
@@ -721,19 +777,22 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
     if x_vals.size == 0 or y_vals.size == 0:
         return []
 
-    if tg_is_y:
-        TG, BG = y_vals, x_vals
+    if axis_space == 'transformed':
+        D, E = _transformed_axis_arrays(x_vals, y_vals, x_axis_name=x_axis_name, y_axis_name=y_axis_name)
     else:
-        TG, BG = x_vals, y_vals
+        if tg_is_y:
+            TG, BG = y_vals, x_vals
+        else:
+            TG, BG = x_vals, y_vals
 
-    if convention == 'TG+rBG':
-        D = TG + ratio * BG
-        E = TG - ratio * BG
-    elif convention == 'rTG+BG':
-        D = ratio * TG + BG
-        E = ratio * TG - BG
-    else:
-        raise ValueError(f"Unknown convention: {convention!r}")
+        if convention == 'TG+rBG':
+            D = TG + ratio * BG
+            E = TG - ratio * BG
+        elif convention == 'rTG+BG':
+            D = ratio * TG + BG
+            E = ratio * TG - BG
+        else:
+            raise ValueError(f"Unknown convention: {convention!r}")
 
     if cut_type == 'doping':
         line_values = D
@@ -742,9 +801,6 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
     else:
         raise ValueError(f"Unknown cut_type: {cut_type!r}. Use 'doping' or 'efield'.")
 
-    # Round to 9 d.p. to eliminate floating-point noise before clustering.
-    # Grid steps (~0.18 V) are orders of magnitude above FP error (~1e-15),
-    # so this is always safe and is essential when epsilon=0.
     line_values = np.round(line_values, 9)
 
     finite_values = np.sort(line_values[np.isfinite(line_values)])
@@ -775,7 +831,6 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
 
     return sorted(cut_values)
 
-
 def plot_map(X2D, Y2D, Z2D,
              x_label='x', y_label='y', z_label='quantity',
              title='', cmap='jet', n_levels=200,
@@ -790,13 +845,33 @@ def plot_map(X2D, Y2D, Z2D,
     """
     fig = Figure(figsize=figsize)
     ax = fig.add_subplot(111)
-    v0, v1, is_flat = _resolve_color_limits(Z2D, vmin=vmin, vmax=vmax)
+    x_arr = np.asarray(X2D, dtype=float)
+    y_arr = np.asarray(Y2D, dtype=float)
+    z_arr = np.asarray(Z2D, dtype=float)
+    v0, v1, is_flat = _resolve_color_limits(z_arr, vmin=vmin, vmax=vmax)
 
-    if _is_rectilinear_grid(X2D, Y2D) and not is_flat:
+    if x_arr.ndim == 1 and y_arr.ndim == 1 and z_arr.ndim == 1:
+        finite = np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(z_arr)
+        xf = x_arr[finite]
+        yf = y_arr[finite]
+        zf = z_arr[finite]
+        if xf.size < 3 or len(np.unique(xf)) < 2 or len(np.unique(yf)) < 2:
+            artist = ax.scatter(xf, yf, c=zf, cmap=cmap, vmin=v0, vmax=v1, s=14, linewidths=0)
+        else:
+            try:
+                triang = mtri.Triangulation(xf, yf)
+                if is_flat:
+                    artist = ax.tripcolor(triang, zf, cmap=cmap, shading='flat', vmin=v0, vmax=v1)
+                else:
+                    levels = np.linspace(v0, v1, n_levels)
+                    artist = ax.tricontourf(triang, zf, levels=levels, cmap=cmap, vmin=v0, vmax=v1)
+            except Exception:
+                artist = ax.scatter(xf, yf, c=zf, cmap=cmap, vmin=v0, vmax=v1, s=14, linewidths=0)
+    elif _is_rectilinear_grid(x_arr, y_arr) and not is_flat:
         levels = np.linspace(v0, v1, n_levels)
-        artist = ax.contourf(X2D, Y2D, Z2D, levels=levels, cmap=cmap, vmin=v0, vmax=v1)
+        artist = ax.contourf(x_arr, y_arr, z_arr, levels=levels, cmap=cmap, vmin=v0, vmax=v1)
     else:
-        artist = ax.pcolormesh(X2D, Y2D, Z2D, cmap=cmap, shading='auto', vmin=v0, vmax=v1)
+        artist = ax.pcolormesh(x_arr, y_arr, z_arr, cmap=cmap, shading='auto', vmin=v0, vmax=v1)
 
     fig.colorbar(artist, ax=ax, label=z_label)
     ax.set_xlabel(x_label)

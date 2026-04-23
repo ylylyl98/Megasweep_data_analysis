@@ -7,7 +7,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from megasweep_analysis import (
-    build_grid,
+    build_map_payload,
     compute_intensity_map,
     compute_peak_energy_map,
     compute_peak_energy,
@@ -214,39 +214,32 @@ class AnalysisRefreshWorker(BaseWorker):
             )
             working_intensity = self.data['Intensity']
 
-        x2d, y2d, z2d, idx_flat, n_x, n_y = build_grid(
+        original_map = build_map_payload(
             self.data["x_data"],
             self.data["y_data"],
             intensity_flat,
         )
-        original_map = {
-            "flat": intensity_flat,
-            "X2D": x2d,
-            "Y2D": y2d,
-            "Z2D": z2d,
-            "idx_flat": idx_flat,
-            "n_x": n_x,
-            "n_y": n_y,
-        }
         payload["original_map"] = original_map
 
         transformed_map = None
         if {"intensity_transformed", "peak_transformed"} & tasks:
-            self.log.emit("Computing transformed coordinate view...")
-            axis1_2d, axis2_2d = compute_transformed_coords(
-                original_map["X2D"],
-                original_map["Y2D"],
-                self.ratio,
-                tg_is_y=self.tg_is_y,
-                convention=self.convention,
-            )
-            transformed_map = {
-                "X2D": axis1_2d,
-                "Y2D": axis2_2d,
-                "Z2D": original_map["Z2D"],
-                "ratio": self.ratio,
-                "convention": self.convention,
-            }
+            axis_space = self.data.get("axis_space", "gate")
+            if axis_space == "transformed":
+                self.log.emit("Loaded axes are already transformed; reusing them for transformed view...")
+                transformed_map = dict(original_map)
+                transformed_map["already_transformed"] = True
+            else:
+                self.log.emit("Computing transformed coordinate view...")
+                axis1, axis2 = compute_transformed_coords(
+                    self.data["x_data"],
+                    self.data["y_data"],
+                    self.ratio,
+                    tg_is_y=self.tg_is_y,
+                    convention=self.convention,
+                )
+                transformed_map = build_map_payload(axis1, axis2, intensity_flat)
+            transformed_map["ratio"] = self.ratio
+            transformed_map["convention"] = self.convention
             payload["transformed_map"] = transformed_map
 
         if {"peak_original", "peak_transformed"} & tasks:
@@ -263,28 +256,37 @@ class AnalysisRefreshWorker(BaseWorker):
             else:
                 self.log.emit("Computing peak-energy map...")
                 peak_flat = compute_peak_energy(working_intensity, self.data['energy'], self.sg_window, self.sg_poly)
-            z_peak = peak_flat[original_map["idx_flat"]].reshape(
-                original_map["n_x"],
-                original_map["n_y"],
-            )
             if "peak_original" in tasks:
-                payload["peak_map_original"] = {
-                    "flat": peak_flat,
-                    "X2D": original_map["X2D"],
-                    "Y2D": original_map["Y2D"],
-                    "Z2D": z_peak,
-                    "target_axes": "original",
-                }
+                peak_original = build_map_payload(
+                    self.data["x_data"],
+                    self.data["y_data"],
+                    peak_flat,
+                )
+                peak_original["target_axes"] = "original"
+                payload["peak_map_original"] = peak_original
             if "peak_transformed" in tasks:
                 if transformed_map is None:
                     raise ValueError("Transformed coordinates were not available for the peak map.")
-                payload["peak_map_transformed"] = {
-                    "flat": peak_flat,
-                    "X2D": transformed_map["X2D"],
-                    "Y2D": transformed_map["Y2D"],
-                    "Z2D": z_peak,
-                    "target_axes": "transformed",
-                }
+                axis_space = self.data.get("axis_space", "gate")
+                if axis_space == "transformed":
+                    peak_transformed = build_map_payload(
+                        self.data["x_data"],
+                        self.data["y_data"],
+                        peak_flat,
+                    )
+                else:
+                    axis1, axis2 = compute_transformed_coords(
+                        self.data["x_data"],
+                        self.data["y_data"],
+                        self.ratio,
+                        tg_is_y=self.tg_is_y,
+                        convention=self.convention,
+                    )
+                    peak_transformed = build_map_payload(axis1, axis2, peak_flat)
+                peak_transformed["target_axes"] = "transformed"
+                peak_transformed["ratio"] = self.ratio
+                peak_transformed["convention"] = self.convention
+                payload["peak_map_transformed"] = peak_transformed
 
         return payload
 
@@ -305,20 +307,11 @@ class IntensityWorker(BaseWorker):
             self.max_energy,
             self.baseline,
         )
-        x2d, y2d, z2d, idx_flat, n_x, n_y = build_grid(
+        return build_map_payload(
             self.data["x_data"],
             self.data["y_data"],
             intensity_flat,
         )
-        return {
-            "flat": intensity_flat,
-            "X2D": x2d,
-            "Y2D": y2d,
-            "Z2D": z2d,
-            "idx_flat": idx_flat,
-            "n_x": n_x,
-            "n_y": n_y,
-        }
 
 
 class TransformWorker(BaseWorker):
@@ -331,20 +324,17 @@ class TransformWorker(BaseWorker):
 
     def process(self) -> dict:
         self.log.emit("Computing transformed coordinates...")
-        axis1_2d, axis2_2d = compute_transformed_coords(
-            self.original_map["X2D"],
-            self.original_map["Y2D"],
+        axis1, axis2 = compute_transformed_coords(
+            self.original_map["x_flat"],
+            self.original_map["y_flat"],
             self.ratio,
             tg_is_y=self.tg_is_y,
             convention=self.convention,
         )
-        return {
-            "X2D": axis1_2d,
-            "Y2D": axis2_2d,
-            "Z2D": self.original_map["Z2D"],
-            "ratio": self.ratio,
-            "convention": self.convention,
-        }
+        payload = build_map_payload(axis1, axis2, self.original_map["z_flat"])
+        payload["ratio"] = self.ratio
+        payload["convention"] = self.convention
+        return payload
 
 
 class PeakWorker(BaseWorker):
@@ -368,29 +358,23 @@ class PeakWorker(BaseWorker):
     def process(self) -> dict:
         self.log.emit("Computing peak map...")
         peak_flat = compute_peak_energy_map(self.data, self.sg_window, self.sg_poly)
-        z2d = peak_flat[self.original_map["idx_flat"]].reshape(
-            self.original_map["n_x"], self.original_map["n_y"]
-        )
-
         if self.target_axes == "transformed" and self.transformed_map is not None:
-            x2d = self.transformed_map["X2D"]
-            y2d = self.transformed_map["Y2D"]
+            payload = build_map_payload(
+                self.transformed_map["x_flat"],
+                self.transformed_map["y_flat"],
+                peak_flat[self.transformed_map["idx_flat"]],
+            )
             target = "transformed"
         else:
-            x2d = self.original_map["X2D"]
-            y2d = self.original_map["Y2D"]
+            payload = build_map_payload(
+                self.original_map["x_flat"],
+                self.original_map["y_flat"],
+                peak_flat[self.original_map["idx_flat"]],
+            )
             target = "original"
 
-        return {
-            "flat": peak_flat,
-            "X2D": x2d,
-            "Y2D": y2d,
-            "Z2D": z2d,
-            "target_axes": target,
-            "idx_flat": self.original_map["idx_flat"],
-            "n_x": self.original_map["n_x"],
-            "n_y": self.original_map["n_y"],
-        }
+        payload["target_axes"] = target
+        return payload
 
 
 class LineWorker(BaseWorker):
@@ -439,6 +423,9 @@ class LineWorker(BaseWorker):
                 epsilon=spec["epsilon"],
                 tg_is_y=self.tg_is_y,
                 convention=self.convention,
+                axis_space=self.data.get("axis_space", "gate"),
+                x_axis_name=self.data.get("x_name", ""),
+                y_axis_name=self.data.get("y_name", ""),
             )
             n_pts = len(line_cut['axis_values'])
             if n_pts == 0:
@@ -510,6 +497,9 @@ class BatchLineWorker(BaseWorker):
                 self.epsilon,
                 tg_is_y=self.tg_is_y,
                 convention=self.convention,
+                axis_space=self.data.get("axis_space", "gate"),
+                x_axis_name=self.data.get("x_name", ""),
+                y_axis_name=self.data.get("y_name", ""),
             )
             self.log.emit(f"Found {len(cut_values)} {cut_type} line cuts to extract.")
 
@@ -525,6 +515,9 @@ class BatchLineWorker(BaseWorker):
                     epsilon=self.epsilon,
                     tg_is_y=self.tg_is_y,
                     convention=self.convention,
+                    axis_space=self.data.get("axis_space", "gate"),
+                    x_axis_name=self.data.get("x_name", ""),
+                    y_axis_name=self.data.get("y_name", ""),
                 )
                 if len(line_cut["axis_values"]) == 0:
                     continue
