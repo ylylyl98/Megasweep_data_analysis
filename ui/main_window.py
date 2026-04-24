@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -790,7 +791,16 @@ class MainWindow(QMainWindow):
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Consolas, Courier New, monospace", 9))
         self.progress_label = ProgressLabel()
+        self.batch_progress_bar = QProgressBar()
+        self.batch_progress_bar.setVisible(False)
+        self.batch_progress_bar.setTextVisible(True)
+        self.batch_progress_bar.setFixedHeight(16)
+        self.batch_progress_bar.setStyleSheet(
+            "QProgressBar { border:1px solid #4a4a4a; border-radius:3px; background:#1e1e1e; color:#e0e0e0; font-size:10px; }"
+            "QProgressBar::chunk { background:#3a6ea8; border-radius:2px; }"
+        )
         log_layout.addWidget(self.progress_label)
+        log_layout.addWidget(self.batch_progress_bar)
         log_layout.addWidget(self.log_text, 1)
         self.open_folder_btn = QPushButton("Open Output Folder")
         self.open_folder_btn.clicked.connect(self._open_output_folder)
@@ -1277,9 +1287,14 @@ class MainWindow(QMainWindow):
             )
 
         if self._dirty_views.get("line_cuts", True):
-            self.linecuts_status_label.setText(
-                "Line cuts are stale or not extracted yet. Refresh the transformed map first, then extract cuts."
-            )
+            if self.state.data.get("axis_space") == "transformed":
+                self.linecuts_status_label.setText(
+                    "Line cuts are stale or not extracted yet. Loaded D/E axes are ready for extraction."
+                )
+            else:
+                self.linecuts_status_label.setText(
+                    "Line cuts are stale or not extracted yet. Refresh the transformed map first, then extract cuts."
+                )
         else:
             self.linecuts_status_label.setText("Line cuts match the current transformed coordinate settings.")
 
@@ -1805,6 +1820,14 @@ class MainWindow(QMainWindow):
         """Map 'axis1' (D) / 'axis2' (E) to 'doping'/'efield' strings."""
         return [{"axis1": "doping", "axis2": "efield"}[a] for a in axes]
 
+    def _batch_linecuts_ready(self) -> bool:
+        """Return whether batch line cuts can be extracted from current axes."""
+        if self.state.data is None:
+            return False
+        if self.state.data.get("axis_space") == "transformed":
+            return True
+        return self.state.transformed_map is not None and not self._dirty_views.get("intensity_transformed", True)
+
     def _on_peak_settings_changed(self) -> None:
         if self.state.data is None:
             return
@@ -2003,32 +2026,59 @@ class MainWindow(QMainWindow):
         convention = self._current_convention()
         try:
             axis_space = data.get("axis_space", "gate")
-            n_doping = len(find_all_cut_values(
+            doping_vals = find_all_cut_values(
                 x, y, "doping", ratio, epsilon,
                 convention=convention,
                 axis_space=axis_space,
                 x_axis_name=data.get("x_name", ""),
                 y_axis_name=data.get("y_name", ""),
-            ))
-            n_efield = len(find_all_cut_values(
+            )
+            efield_vals = find_all_cut_values(
                 x, y, "efield", ratio, epsilon,
                 convention=convention,
                 axis_space=axis_space,
                 x_axis_name=data.get("x_name", ""),
                 y_axis_name=data.get("y_name", ""),
-            ))
+            )
         except Exception as exc:
             self.batch_preview_label.setText(f"Preview error: {exc}")
             return
-        lines = [
-            f"Doping : {n_doping:>4} cuts  →  {n_doping} CSV + {n_doping} PNG",
-            f"Efield : {n_efield:>4} cuts  →  {n_efield} CSV + {n_efield} PNG",
-            f"Both   : {n_doping + n_efield:>4} cuts  →  {n_doping + n_efield} CSV + {n_doping + n_efield} PNG",
+
+        def _range_str(vals):
+            if not vals:
+                return "(none)"
+            if len(vals) == 1:
+                return f"{vals[0]:.3f}"
+            return f"{vals[0]:.3f} … {vals[-1]:.3f}"
+
+        n_doping = len(doping_vals)
+        n_efield = len(efield_vals)
+        label_lines = [
+            f"Doping : {n_doping} cuts   [{_range_str(doping_vals)}]",
+            f"Efield : {n_efield} cuts   [{_range_str(efield_vals)}]",
+            f"Both   : {n_doping + n_efield} cuts total  (see log for values)",
         ]
-        self.batch_preview_label.setText("\n".join(lines))
+        self.batch_preview_label.setText("\n".join(label_lines))
+
+        def _log_vals(label, vals):
+            if not vals:
+                self._append_log(f"{label}: (none)", "info")
+                return
+            chunk_size = 10
+            chunks = [vals[i:i + chunk_size] for i in range(0, len(vals), chunk_size)]
+            self._append_log(f"{label} ({len(vals)} values):", "info")
+            for chunk in chunks:
+                self._append_log("  " + ",  ".join(f"{v:.3f}" for v in chunk), "info")
+
+        self._append_log(f"── Batch preview  (epsilon={epsilon}) ──", "info")
+        _log_vals("Doping", doping_vals)
+        _log_vals("Efield", efield_vals)
 
     def _start_batch_line_stage(self, cut_types: list[str]) -> None:
-        if self.state.data is None or self.state.transformed_map is None or self._dirty_views.get("intensity_transformed", True):
+        if self.state.data is None:
+            self._append_log("Load a CSV before batch-extracting line cuts.", "error")
+            return
+        if not self._batch_linecuts_ready():
             self._append_log("Refresh the transformed map with the current settings before batch-extracting line cuts.", "error")
             return
         if not self._validate_reflection_background_ready():
@@ -2069,6 +2119,7 @@ class MainWindow(QMainWindow):
 
         self._thread.started.connect(worker.run)
         worker.log.connect(self._log_worker_message)
+        worker.progress.connect(self._on_worker_progress)
         worker.finished.connect(on_success)
         worker.finished.connect(self._on_worker_finished)
         worker.error.connect(self._on_worker_error)
@@ -2081,6 +2132,14 @@ class MainWindow(QMainWindow):
     def _log_worker_message(self, message: str) -> None:
         self._append_log(message, "info")
 
+    def _on_worker_progress(self, current: int, total: int) -> None:
+        if total <= 0:
+            return
+        self.batch_progress_bar.setMaximum(total)
+        self.batch_progress_bar.setValue(current)
+        self.batch_progress_bar.setFormat(f"{current} / {total}  (%p%)")
+        self.batch_progress_bar.setVisible(True)
+
     def _cleanup_worker(self) -> None:
         if self._worker is not None:
             self._worker.deleteLater()
@@ -2092,6 +2151,8 @@ class MainWindow(QMainWindow):
     def _on_worker_finished(self, _result) -> None:
         try:
             self.progress_label.setVisible(False)
+            self.batch_progress_bar.setVisible(False)
+            self.batch_progress_bar.setValue(0)
             self._set_controls_enabled(True)
             self._refresh_stage_states()
         except Exception:
@@ -2102,6 +2163,8 @@ class MainWindow(QMainWindow):
             self._append_log(tb, "error")
             self._set_controls_enabled(True)
             self.progress_label.setVisible(False)
+            self.batch_progress_bar.setVisible(False)
+            self.batch_progress_bar.setValue(0)
             context = f" ({self._pending_context})" if self._pending_context else ""
             self._append_log(f"Worker failed{context}.", "error")
         except Exception:
@@ -2417,6 +2480,7 @@ class MainWindow(QMainWindow):
             has_background = self.state.background_spectra is not None
             has_original_map = self.state.original_map is not None
             has_transformed_map = self.state.transformed_map is not None and not self._dirty_views.get("intensity_transformed", True)
+            batch_linecuts_ready = self._batch_linecuts_ready()
 
             self.load_csv_btn.setEnabled(bool(csv_is_file))
             self.load_bg_btn.setEnabled(bool(has_data and is_rc))
@@ -2424,9 +2488,9 @@ class MainWindow(QMainWindow):
             self.refresh_current_btn.setEnabled(bool(has_data and (not is_rc or has_background)))
             self.refresh_all_maps_btn.setEnabled(bool(has_data and (not is_rc or has_background)))
             self.plot_lines_btn.setEnabled(bool(has_data))
-            self.extract_all_doping_btn.setEnabled(bool(has_transformed_map))
-            self.extract_all_efield_btn.setEnabled(bool(has_transformed_map))
-            self.extract_all_both_btn.setEnabled(bool(has_transformed_map))
+            self.extract_all_doping_btn.setEnabled(bool(batch_linecuts_ready))
+            self.extract_all_efield_btn.setEnabled(bool(batch_linecuts_ready))
+            self.extract_all_both_btn.setEnabled(bool(batch_linecuts_ready))
 
             save_enabled = bool(self._current_map_figure() is not None)
             self.save_current_png_btn.setEnabled(save_enabled)

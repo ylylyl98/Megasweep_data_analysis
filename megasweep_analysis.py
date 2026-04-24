@@ -715,12 +715,13 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
     else:
         raise ValueError(f"Unknown cut_type: {cut_type!r}. Use 'doping' or 'efield'.")
 
-    line_values = np.round(line_values, 9)
+    line_values = np.round(line_values, 6)
     vary_values = np.asarray(vary_values, dtype=float)
-    c_value = round(c_value, 9)
+    c_value = round(c_value, 6)
 
+    _eps = max(float(epsilon), 1e-3)
     dist = np.abs(line_values - c_value)
-    sel_idx = np.where(dist <= epsilon)[0]
+    sel_idx = np.where(dist <= _eps)[0]
 
     if sel_idx.size == 0:
         empty = np.empty(0, dtype=float)
@@ -801,16 +802,21 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
     else:
         raise ValueError(f"Unknown cut_type: {cut_type!r}. Use 'doping' or 'efield'.")
 
-    line_values = np.round(line_values, 9)
+    line_values = np.round(line_values, 6)
 
     finite_values = np.sort(line_values[np.isfinite(line_values)])
     if finite_values.size == 0:
         return []
 
+    # 1 mV floor absorbs instrument axis noise so that measurements of the same
+    # setpoint always cluster together.  Setpoints in typical gate-sweep data
+    # are >>10 mV apart, so this never merges distinct lines.
+    _eps = max(float(epsilon), 1e-3)
+    gap_threshold = 2.0 * _eps
+
     clusters = []
     current_cluster = [float(finite_values[0])]
     current_center = float(finite_values[0])
-    gap_threshold = max(2.0 * float(epsilon), 1e-9)
 
     for value in finite_values[1:]:
         value = float(value)
@@ -825,7 +831,7 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
     cut_values = []
     for cluster in clusters:
         c_value = float(np.mean(cluster))
-        count = int(np.count_nonzero(np.abs(line_values - c_value) <= epsilon))
+        count = int(np.count_nonzero(np.abs(line_values - c_value) <= _eps))
         if count >= min_points:
             cut_values.append(c_value)
 
@@ -887,7 +893,8 @@ def plot_line_cut_spectrogram(line_cut: dict,
                                cmap: str = 'RdBu_r',
                                z_label: str = 'Intensity',
                                figsize: tuple = (7, 4.8),
-                               vmin=None, vmax=None) -> tuple:
+                               vmin=None, vmax=None,
+                               ylim=None) -> tuple:
     """
     Plot a line-cut spectrogram (energy vs. axis value, colour = intensity).
 
@@ -911,6 +918,13 @@ def plot_line_cut_spectrogram(line_cut: dict,
     fig = Figure(figsize=figsize)
     ax = fig.add_subplot(111)
 
+    # Use percentile bounds by default so cosmic ray spikes don't dominate the scale.
+    # Explicit vmin/vmax override this.
+    if vmin is None or vmax is None:
+        finite = spectra[np.isfinite(spectra)]
+        if finite.size > 0:
+            vmin = vmin if vmin is not None else float(np.percentile(finite, 0.5))
+            vmax = vmax if vmax is not None else float(np.percentile(finite, 99.5))
     v0, v1, _ = _resolve_color_limits(spectra, vmin=vmin, vmax=vmax)
 
     E_grid, Y_grid = np.meshgrid(energy, axis_values)
@@ -920,6 +934,8 @@ def plot_line_cut_spectrogram(line_cut: dict,
     fig.colorbar(artist, ax=ax, label=z_label)
     ax.set_xlabel('Energy (eV)')
     ax.set_ylabel(line_cut.get('axis_label', 'Axis'))
+    if ylim is not None:
+        ax.set_ylim(ylim)
     if title:
         ax.set_title(title)
     fig.tight_layout()

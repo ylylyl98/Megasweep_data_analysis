@@ -44,6 +44,7 @@ class BaseWorker(QObject):
     finished = Signal(object)
     error = Signal(str)
     log = Signal(str)
+    progress = Signal(int, int)   # (current, total)
 
     def run(self) -> None:
         try:
@@ -484,10 +485,9 @@ class BatchLineWorker(BaseWorker):
 
         _subfolder = {"doping": "doping_fixed", "efield": "efield_fixed"}
 
+        # Build per-cut-type work lists and compute global y ranges in one scan
+        cut_type_values: dict[str, list[float]] = {}
         for cut_type in self.cut_types:
-            subfolder = os.path.join(self.output_dir, _subfolder.get(cut_type, cut_type))
-            os.makedirs(subfolder, exist_ok=True)
-
             self.log.emit(f"Finding all {cut_type} cut values...")
             cut_values = find_all_cut_values(
                 self.data["x_data"],
@@ -502,9 +502,14 @@ class BatchLineWorker(BaseWorker):
                 y_axis_name=self.data.get("y_name", ""),
             )
             self.log.emit(f"Found {len(cut_values)} {cut_type} line cuts to extract.")
+            cut_type_values[cut_type] = cut_values
 
+        # Pass 1 — scan axis_values across every cut to get the global y range per type
+        global_ylim: dict[str, tuple[float, float]] = {}
+        for cut_type, cut_values in cut_type_values.items():
+            y_min, y_max = float("inf"), float("-inf")
             for c_value in cut_values:
-                line_cut = extract_line_cut(
+                lc = extract_line_cut(
                     raw_data,
                     self.data["x_data"],
                     self.data["y_data"],
@@ -519,31 +524,69 @@ class BatchLineWorker(BaseWorker):
                     x_axis_name=self.data.get("x_name", ""),
                     y_axis_name=self.data.get("y_name", ""),
                 )
-                if len(line_cut["axis_values"]) == 0:
-                    continue
+                av = lc["axis_values"]
+                if len(av):
+                    y_min = min(y_min, float(np.min(av)))
+                    y_max = max(y_max, float(np.max(av)))
+            if y_min < y_max:
+                global_ylim[cut_type] = (y_min, y_max)
+                self.log.emit(f"  {cut_type} y range: [{y_min:.3f}, {y_max:.3f}]")
 
-                # Use 'n'/'p' prefix instead of '+'/'-' — '+' is invalid in Windows filenames
-                sign = "n" if c_value < 0 else "p"
-                stem = f"{self.source_name}_{cut_type}_{sign}{abs(c_value):.4f}"
-                csv_path = os.path.join(subfolder, f"{stem}.csv")
-                save_line_csv(line_cut, csv_path)
-                saved_files.append(csv_path)
+        # Pass 2 — extract, save CSV, and plot using the shared y range
+        work_items: list[tuple[str, float]] = [
+            (ct, cv) for ct, cvs in cut_type_values.items() for cv in cvs
+        ]
+        total_work = len(work_items)
+        self.progress.emit(0, total_work)
 
-                spectra_array = np.asarray(line_cut["spectra"])
-                if spectra_array.shape[0] >= 2:
-                    cmap = "RdBu_r" if is_rc else "jet"
-                    z_label = "RC (ΔI/I₀)" if is_rc else "PL Intensity (a.u.)"
-                    fig, _ = plot_line_cut_spectrogram(
-                        line_cut,
-                        title=f"{cut_type.capitalize()} = {c_value:.3f} V",
-                        cmap=cmap,
-                        z_label=z_label,
-                    )
-                    png_path = os.path.join(subfolder, f"{stem}.png")
-                    save_figure(fig, png_path)
-                    saved_files.append(png_path)
+        for done, (cut_type, c_value) in enumerate(work_items, start=1):
+            subfolder = os.path.join(self.output_dir, _subfolder.get(cut_type, cut_type))
+            os.makedirs(subfolder, exist_ok=True)
 
-                total_cuts += 1
+            line_cut = extract_line_cut(
+                raw_data,
+                self.data["x_data"],
+                self.data["y_data"],
+                self.data["energy"],
+                cut_type=cut_type,
+                c_value=c_value,
+                ratio=self.ratio,
+                epsilon=self.epsilon,
+                tg_is_y=self.tg_is_y,
+                convention=self.convention,
+                axis_space=self.data.get("axis_space", "gate"),
+                x_axis_name=self.data.get("x_name", ""),
+                y_axis_name=self.data.get("y_name", ""),
+            )
+
+            self.progress.emit(done, total_work)
+
+            if len(line_cut["axis_values"]) == 0:
+                continue
+
+            # Use 'n'/'p' prefix instead of '+'/'-' — '+' is invalid in Windows filenames
+            sign = "n" if c_value < 0 else "p"
+            stem = f"{self.source_name}_{cut_type}_{sign}{abs(c_value):.4f}"
+            csv_path = os.path.join(subfolder, f"{stem}.csv")
+            save_line_csv(line_cut, csv_path)
+            saved_files.append(csv_path)
+
+            spectra_array = np.asarray(line_cut["spectra"])
+            if spectra_array.shape[0] >= 2:
+                cmap = "RdBu_r" if is_rc else "jet"
+                z_label = "RC (ΔI/I₀)" if is_rc else "PL Intensity (a.u.)"
+                fig, _ = plot_line_cut_spectrogram(
+                    line_cut,
+                    title=f"{cut_type.capitalize()} = {c_value:.3f} V",
+                    cmap=cmap,
+                    z_label=z_label,
+                    ylim=global_ylim.get(cut_type),
+                )
+                png_path = os.path.join(subfolder, f"{stem}.png")
+                save_figure(fig, png_path)
+                saved_files.append(png_path)
+
+            total_cuts += 1
 
         self.log.emit(f"Batch extraction done: {total_cuts} cuts, {len(saved_files)} files saved.")
         return {"saved_files": saved_files, "total_cuts": total_cuts}
