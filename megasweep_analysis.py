@@ -227,6 +227,66 @@ def sum_select_region(Intensity, energy, min_energy, max_energy, baseline=595):
     return result
 
 
+def estimate_global_baseline(Intensity, energy, min_energy, max_energy,
+                             per_spectrum_percentile=10.0,
+                             fallback_percentile=10.0,
+                             min_baseline_channels=5,
+                             return_info=False):
+    """
+    Estimate one flat baseline value shared by all spectra.
+
+    The preferred estimate uses channels outside the integration window:
+    take a low percentile for each spectrum, then the median across spectra.
+    If too few outside-window channels exist, fall back to a global low
+    percentile over the full intensity matrix.
+    """
+    intensity = np.asarray(Intensity, dtype=float)
+    energy_arr = np.asarray(energy, dtype=float).reshape(-1)
+    if intensity.ndim != 2:
+        raise ValueError("Intensity must be a 2-D array of spectra.")
+    if intensity.shape[1] != energy_arr.size:
+        raise ValueError("Intensity channel count must match energy length.")
+
+    e_lo, e_hi = sorted((float(min_energy), float(max_energy)))
+    finite_energy = np.isfinite(energy_arr)
+    integration_mask = finite_energy & (energy_arr > e_lo) & (energy_arr < e_hi)
+    baseline_mask = finite_energy & ~integration_mask
+    baseline_channels = int(np.count_nonzero(baseline_mask))
+
+    info = {
+        "method": "outside_window",
+        "fallback": False,
+        "baseline_channels": baseline_channels,
+        "spectrum_count": int(intensity.shape[0]),
+        "per_spectrum_percentile": float(per_spectrum_percentile),
+        "fallback_percentile": float(fallback_percentile),
+    }
+
+    if baseline_channels >= int(min_baseline_channels):
+        region = intensity[:, baseline_mask]
+        per_spectrum = []
+        for spectrum in region:
+            finite = spectrum[np.isfinite(spectrum)]
+            if finite.size:
+                per_spectrum.append(float(np.percentile(finite, per_spectrum_percentile)))
+        if per_spectrum:
+            baseline = float(np.median(per_spectrum))
+            info["used_spectrum_count"] = len(per_spectrum)
+            return (baseline, info) if return_info else baseline
+
+    finite_intensity = intensity[np.isfinite(intensity)]
+    if finite_intensity.size == 0:
+        raise ValueError("Cannot estimate baseline: intensity matrix contains no finite values.")
+    baseline = float(np.percentile(finite_intensity, fallback_percentile))
+    info.update({
+        "method": "full_spectrum_percentile",
+        "fallback": True,
+        "used_spectrum_count": int(intensity.shape[0]),
+        "baseline_channels": int(intensity.shape[1]),
+    })
+    return (baseline, info) if return_info else baseline
+
+
 def _normalize_sg_params(npts: int, sg_window: int, sg_poly: int) -> tuple[int, int]:
     """Clamp SG settings to valid values for the available point count."""
     if npts < 3:
@@ -650,8 +710,8 @@ def compute_transformed_coords(X2D, Y2D, ratio, tg_is_y=True, convention="TG+rBG
 
 def _transformed_axis_arrays(x_data, y_data, x_axis_name='', y_axis_name=''):
     """Return (doping_array, efield_array) from already-transformed loaded axes."""
-    x_vals = np.asarray(x_data, dtype=float)
-    y_vals = np.asarray(y_data, dtype=float)
+    x_vals = np.asarray(x_data, dtype=float).reshape(-1)
+    y_vals = np.asarray(y_data, dtype=float).reshape(-1)
     x_name = str(x_axis_name).lower().replace('_', '').replace(' ', '')
     y_name = str(y_axis_name).lower().replace('_', '').replace(' ', '')
 
@@ -694,13 +754,13 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
         if convention == 'TG+rBG':
             D = TG + r * BG
             E = TG - r * BG
-            d_label = f'TG + {r}?BG (V)'
-            e_label = f'TG ? {r}?BG (V)'
+            d_label = f'TG + {r}·BG (V)'
+            e_label = f'TG − {r}·BG (V)'
         elif convention == 'rTG+BG':
             D = r * TG + BG
             E = r * TG - BG
-            d_label = f'{r}?TG + BG (V)'
-            e_label = f'{r}?TG ? BG (V)'
+            d_label = f'{r}·TG + BG (V)'
+            e_label = f'{r}·TG − BG (V)'
         else:
             raise ValueError(f"Unknown convention: {convention!r}")
 
@@ -760,11 +820,62 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
     }
 
 
+def _dominant_lattice_member_mask(values, min_fraction=0.75):
+    """
+    Return a mask for values that lie on the dominant regular axis lattice.
+
+    Some sweeps include an adjusted terminal setpoint, for example
+    -8.000..10.900 in 0.150 V steps plus a final 11.000 V endpoint.  The
+    endpoint is useful data, but using it to discover every batch line cut
+    creates a second family of tiny off-lattice transformed cuts.
+    """
+    vals = np.asarray(values, dtype=float).reshape(-1)
+    mask_all = np.ones(vals.shape, dtype=bool)
+    finite = vals[np.isfinite(vals)]
+    if finite.size < 4:
+        return mask_all
+
+    unique_vals = np.unique(np.round(finite, 9))
+    if unique_vals.size < 4:
+        return mask_all
+
+    diffs = np.diff(unique_vals)
+    diffs = diffs[diffs > 1e-9]
+    if diffs.size < 3:
+        return mask_all
+
+    rounded_diffs = np.round(diffs, 6)
+    step_values, step_counts = np.unique(rounded_diffs, return_counts=True)
+    best_step = float(step_values[int(np.argmax(step_counts))])
+    best_step_count = int(np.max(step_counts))
+    if best_step <= 0 or best_step_count / diffs.size < min_fraction:
+        return mask_all
+
+    tol = max(1e-6, min(1e-3, best_step * 0.05))
+    best_anchor = float(unique_vals[0])
+    best_count = 0
+    for anchor in unique_vals:
+        nearest = np.rint((unique_vals - anchor) / best_step)
+        residual = np.abs(unique_vals - (anchor + nearest * best_step))
+        count = int(np.count_nonzero(residual <= tol))
+        if count > best_count:
+            best_count = count
+            best_anchor = float(anchor)
+
+    if best_count == unique_vals.size or best_count / unique_vals.size < min_fraction:
+        return mask_all
+
+    nearest = np.rint((vals - best_anchor) / best_step)
+    residual = np.abs(vals - (best_anchor + nearest * best_step))
+    return np.isfinite(vals) & (residual <= tol)
+
+
 
 def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
                         min_points=2, tg_is_y=True, convention='TG+rBG',
                         axis_space='gate',
-                        x_axis_name='', y_axis_name=''):
+                        x_axis_name='', y_axis_name='',
+                        dominant_lattice_only=True):
     """
     Find representative constant-axis values for batch line-cut extraction.
     """
@@ -773,13 +884,14 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
     if min_points < 1:
         raise ValueError("min_points must be at least 1.")
 
-    x_vals = np.asarray(x_data, dtype=float)
-    y_vals = np.asarray(y_data, dtype=float)
+    x_vals = np.asarray(x_data, dtype=float).reshape(-1)
+    y_vals = np.asarray(y_data, dtype=float).reshape(-1)
     if x_vals.size == 0 or y_vals.size == 0:
         return []
 
     if axis_space == 'transformed':
         D, E = _transformed_axis_arrays(x_vals, y_vals, x_axis_name=x_axis_name, y_axis_name=y_axis_name)
+        candidate_mask = np.ones(x_vals.shape, dtype=bool)
     else:
         if tg_is_y:
             TG, BG = y_vals, x_vals
@@ -795,6 +907,14 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
         else:
             raise ValueError(f"Unknown convention: {convention!r}")
 
+        if dominant_lattice_only:
+            candidate_mask = (
+                _dominant_lattice_member_mask(x_vals)
+                & _dominant_lattice_member_mask(y_vals)
+            )
+        else:
+            candidate_mask = np.ones(x_vals.shape, dtype=bool)
+
     if cut_type == 'doping':
         line_values = D
     elif cut_type == 'efield':
@@ -803,8 +923,9 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
         raise ValueError(f"Unknown cut_type: {cut_type!r}. Use 'doping' or 'efield'.")
 
     line_values = np.round(line_values, 6)
+    candidate_line_values = line_values[candidate_mask]
 
-    finite_values = np.sort(line_values[np.isfinite(line_values)])
+    finite_values = np.sort(candidate_line_values[np.isfinite(candidate_line_values)])
     if finite_values.size == 0:
         return []
 
@@ -831,7 +952,7 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
     cut_values = []
     for cluster in clusters:
         c_value = float(np.mean(cluster))
-        count = int(np.count_nonzero(np.abs(line_values - c_value) <= _eps))
+        count = int(np.count_nonzero(np.abs(candidate_line_values - c_value) <= _eps))
         if count >= min_points:
             cut_values.append(c_value)
 

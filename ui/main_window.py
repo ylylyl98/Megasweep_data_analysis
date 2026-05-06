@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 
 from megasweep_analysis import (
     compute_rc_spectra,
+    estimate_global_baseline,
     extract_line_cut,
     find_all_cut_values,
     plot_line_cut_spectrogram,
@@ -750,6 +751,7 @@ class MainWindow(QMainWindow):
             lambda checked: (
                 self.map_vmin_spin.setEnabled(not checked),
                 self.map_vmax_spin.setEnabled(not checked),
+                self._sync_color_limit_controls() if checked else None,
             )
         )
         scale_row.addWidget(self.map_auto_scale_check)
@@ -903,12 +905,18 @@ class MainWindow(QMainWindow):
 
         self.int_min_spin = self._dspin(0.01, 10.0, 0.01, 3, 1.247)
         self.int_max_spin = self._dspin(0.01, 10.0, 0.01, 3, 1.428)
-        self.baseline_spin = self._dspin(0.0, 1e6, 1.0, 0, 595.0)
+        self.baseline_spin = self._dspin(0.0, 1e6, 1.0, 2, 595.0)
         self.ratio_spin = self._dspin(0.001, 100.0, 0.01, 4, 1.0)
         self.int_min_spin.valueChanged.connect(self._on_energy_window_changed)
         self.int_max_spin.valueChanged.connect(self._on_energy_window_changed)
         self.baseline_spin.valueChanged.connect(self._on_baseline_changed)
         self.ratio_spin.valueChanged.connect(self._on_ratio_changed)
+        self.auto_baseline_check = QCheckBox("Auto")
+        self.auto_baseline_check.setChecked(True)
+        self.auto_baseline_check.toggled.connect(self._on_auto_baseline_toggled)
+        self.estimate_baseline_btn = QPushButton("Estimate")
+        self.estimate_baseline_btn.clicked.connect(lambda: self._estimate_and_apply_baseline())
+        self.baseline_spin.setEnabled(False)
 
         self.sg_window_spin = QSpinBox()
         self.sg_window_spin.setRange(3, 501)
@@ -954,7 +962,12 @@ class MainWindow(QMainWindow):
 
         # Baseline row – keep a reference so we can hide it in Reflection mode
         self.baseline_form_label = QLabel("Baseline:")
-        form.addRow(self.baseline_form_label, self.baseline_spin)
+        self.baseline_row_widget = self._hrow(
+            self.baseline_spin,
+            self.auto_baseline_check,
+            self.estimate_baseline_btn,
+        )
+        form.addRow(self.baseline_form_label, self.baseline_row_widget)
 
         form.addRow("Ratio:", self.ratio_spin)
         form.addRow("Convention:", self.convention_combo)
@@ -1120,8 +1133,9 @@ class MainWindow(QMainWindow):
         self.cuts_table.setColumnWidth(0, 96)
         self.cuts_table.setColumnWidth(2, 90)
         self.cuts_table.verticalHeader().setVisible(False)
-        self.cuts_table.setMaximumHeight(180)
-        self.cuts_table.itemChanged.connect(self._on_linecut_settings_changed)
+        self.cuts_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.cuts_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.cuts_table.itemChanged.connect(self._on_linecut_item_changed)
         layout.addWidget(self.cuts_table)
 
         self.plot_lines_btn = QPushButton("Extract Line Cuts")
@@ -1163,6 +1177,26 @@ class MainWindow(QMainWindow):
 
         self._add_cut("doping", 0.0, 0.0)
         return group
+
+    def _resize_linecuts_table(self) -> None:
+        """Keep the line-cut table compact until enough rows need scrolling."""
+        if not hasattr(self, "cuts_table"):
+            return
+        row_count = max(1, self.cuts_table.rowCount())
+        visible_rows = min(row_count, 4)
+        header_height = max(
+            self.cuts_table.horizontalHeader().height(),
+            self.cuts_table.horizontalHeader().sizeHint().height(),
+        )
+        row_height = max(
+            self.cuts_table.verticalHeader().defaultSectionSize(),
+            self.cuts_table.sizeHintForRow(0) if self.cuts_table.rowCount() else 0,
+            28,
+        )
+        frame = self.cuts_table.frameWidth() * 2
+        height = header_height + visible_rows * row_height + frame + 6
+        self.cuts_table.setMinimumHeight(height)
+        self.cuts_table.setMaximumHeight(height)
 
     @staticmethod
     def _hrow(*widgets) -> QWidget:
@@ -1236,12 +1270,33 @@ class MainWindow(QMainWindow):
         }
         return self.state.figures.get(key_map[view_key])
 
+    def _sync_color_limit_controls(self) -> None:
+        """Show the current map's actual finite data range while auto-scale is on."""
+        if not hasattr(self, "map_vmin_spin") or not self.map_auto_scale_check.isChecked():
+            return
+        payload = self._current_map_payload()
+        if payload is None or "Z2D" not in payload:
+            return
+        z_data = np.asarray(payload["Z2D"], dtype=float)
+        finite = z_data[np.isfinite(z_data)]
+        if finite.size == 0:
+            return
+        vmin = float(np.min(finite))
+        vmax = float(np.max(finite))
+        old_vmin_block = self.map_vmin_spin.blockSignals(True)
+        old_vmax_block = self.map_vmax_spin.blockSignals(True)
+        self.map_vmin_spin.setValue(vmin)
+        self.map_vmax_spin.setValue(vmax)
+        self.map_vmin_spin.blockSignals(old_vmin_block)
+        self.map_vmax_spin.blockSignals(old_vmax_block)
+
     def _show_current_map_view(self) -> None:
         figure = self._current_map_figure()
         if figure is None:
             self.map_plot_tab.clear()
         else:
             self.map_plot_tab.set_figure(figure)
+        self._sync_color_limit_controls()
         self._update_status_labels()
 
     def _on_map_selection_changed(self, _value: str) -> None:
@@ -1747,12 +1802,59 @@ class MainWindow(QMainWindow):
                 self._preview_reflection_spectra()
             else:
                 self._clear_reflection_preview()
+        elif self.auto_baseline_check.isChecked() and self.state.data is not None:
+            self._estimate_and_apply_baseline(log=False, mark_dirty=False)
         self._on_intensity_settings_changed()
 
     def _on_baseline_changed(self) -> None:
         if not self._suppress_baseline_tracking:
             self._baseline_user_modified = True
         self._on_intensity_settings_changed()
+
+    def _on_auto_baseline_toggled(self, checked: bool) -> None:
+        self.baseline_spin.setEnabled(not checked)
+        if checked:
+            self._baseline_user_modified = False
+            self._estimate_and_apply_baseline()
+
+    def _estimate_and_apply_baseline(self, log: bool = True, mark_dirty: bool = True) -> bool:
+        if self.state.data is None:
+            if log:
+                self._append_log("Load a CSV before estimating the baseline.", "warn")
+            return False
+        if self.state.mode == "Reflection":
+            return False
+
+        try:
+            baseline, info = estimate_global_baseline(
+                self.state.data["Intensity"],
+                self.state.data["energy"],
+                self.int_min_spin.value(),
+                self.int_max_spin.value(),
+                return_info=True,
+            )
+        except Exception as exc:
+            if log:
+                self._append_log(f"Auto baseline estimate failed: {exc}", "error")
+            return False
+
+        self._suppress_baseline_tracking = True
+        self.baseline_spin.setValue(baseline)
+        self._suppress_baseline_tracking = False
+        self._baseline_user_modified = not self.auto_baseline_check.isChecked()
+
+        if log:
+            level = "warn" if info.get("fallback") else "success"
+            method = "full-spectrum fallback" if info.get("fallback") else "outside-window spectra"
+            self._append_log(
+                f"Baseline estimated: {baseline:.3f} counts/channel from {method} "
+                f"({info.get('used_spectrum_count', info.get('spectrum_count'))} spectra, "
+                f"{info.get('baseline_channels')} channels).",
+                level,
+            )
+        if mark_dirty:
+            self._on_intensity_settings_changed()
+        return True
 
     def _on_ratio_changed(self) -> None:
         self.state.current_ratio = self.ratio_spin.value()
@@ -1851,6 +1953,75 @@ class MainWindow(QMainWindow):
         self._append_log("Line-cut settings changed. Re-extract cuts when ready.", "warn")
         self._refresh_stage_states()
 
+    def _on_linecut_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == 1:
+            self._snap_linecut_row_value(item.row())
+        else:
+            self._on_linecut_settings_changed()
+
+    def _on_linecut_type_changed(self, combo: QComboBox) -> None:
+        for row in range(self.cuts_table.rowCount()):
+            if self.cuts_table.cellWidget(row, 0) is combo:
+                self._snap_linecut_row_value(row)
+                return
+        self._on_linecut_settings_changed()
+
+    def _nearest_cut_value(self, cut_type: str, requested: float, epsilon: float) -> float | None:
+        data = self.state.data
+        if data is None:
+            return None
+        values = find_all_cut_values(
+            data["x_data"],
+            data["y_data"],
+            cut_type,
+            self.state.current_ratio,
+            epsilon,
+            convention=self._current_convention(),
+            axis_space=data.get("axis_space", "gate"),
+            x_axis_name=data.get("x_name", ""),
+            y_axis_name=data.get("y_name", ""),
+        )
+        if not values:
+            return None
+        arr = np.asarray(values, dtype=float)
+        distances = np.abs(arr - requested)
+        min_dist = np.min(distances)
+        return float(arr[distances == min_dist][0])
+
+    def _snap_linecut_row_value(self, row: int) -> None:
+        if self.state.data is None:
+            self._on_linecut_settings_changed()
+            return
+        combo = self.cuts_table.cellWidget(row, 0)
+        value_item = self.cuts_table.item(row, 1)
+        eps_item = self.cuts_table.item(row, 2)
+        if combo is None or value_item is None or eps_item is None:
+            self._on_linecut_settings_changed()
+            return
+
+        try:
+            requested = float(value_item.text())
+            epsilon = float(eps_item.text())
+        except ValueError:
+            self._on_linecut_settings_changed()
+            return
+
+        snapped = self._nearest_cut_value(combo.currentText(), requested, epsilon)
+        if snapped is None:
+            self.linecuts_status_label.setText("No existing line-cut values are available for snapping.")
+            self._on_linecut_settings_changed()
+            return
+
+        if not np.isclose(snapped, requested, rtol=0.0, atol=5e-7):
+            self.cuts_table.blockSignals(True)
+            value_item.setText(f"{snapped:.6g}")
+            self.cuts_table.blockSignals(False)
+            self.linecuts_status_label.setText(
+                f"Snapped {combo.currentText()} cut from {requested:.4f} to {snapped:.4f} V."
+            )
+
+        self._on_linecut_settings_changed()
+
     def _extract_gate_columns(self, columns: list[str]) -> list[str]:
         gate_columns = []
         for column in columns:
@@ -1912,15 +2083,17 @@ class MainWindow(QMainWindow):
         combo = QComboBox()
         combo.addItems(["doping", "efield"])
         combo.setCurrentText(cut_type)
-        combo.currentTextChanged.connect(self._on_linecut_settings_changed)
+        combo.currentTextChanged.connect(lambda _text, c=combo: self._on_linecut_type_changed(c))
         self.cuts_table.setCellWidget(row, 0, combo)
         self.cuts_table.setItem(row, 1, QTableWidgetItem(str(c_value)))
         self.cuts_table.setItem(row, 2, QTableWidgetItem(str(epsilon)))
+        self._resize_linecuts_table()
 
     def _remove_selected_cut(self) -> None:
         rows = sorted({index.row() for index in self.cuts_table.selectedIndexes()}, reverse=True)
         for row in rows:
             self.cuts_table.removeRow(row)
+        self._resize_linecuts_table()
         self._on_linecut_settings_changed()
 
     def _start_csv_load(self) -> None:
@@ -2026,20 +2199,33 @@ class MainWindow(QMainWindow):
         convention = self._current_convention()
         try:
             axis_space = data.get("axis_space", "gate")
-            doping_vals = find_all_cut_values(
-                x, y, "doping", ratio, epsilon,
-                convention=convention,
-                axis_space=axis_space,
-                x_axis_name=data.get("x_name", ""),
-                y_axis_name=data.get("y_name", ""),
-            )
-            efield_vals = find_all_cut_values(
-                x, y, "efield", ratio, epsilon,
-                convention=convention,
-                axis_space=axis_space,
-                x_axis_name=data.get("x_name", ""),
-                y_axis_name=data.get("y_name", ""),
-            )
+            x_name = data.get("x_name", "")
+            y_name = data.get("y_name", "")
+
+            def _find_values(cut_type: str, *, dominant_lattice_only: bool = True):
+                return find_all_cut_values(
+                    x, y, cut_type, ratio, epsilon,
+                    convention=convention,
+                    axis_space=axis_space,
+                    x_axis_name=x_name,
+                    y_axis_name=y_name,
+                    dominant_lattice_only=dominant_lattice_only,
+                )
+
+            doping_vals = _find_values("doping")
+            efield_vals = _find_values("efield")
+            if axis_space == "gate":
+                doping_skipped = max(
+                    0,
+                    len(_find_values("doping", dominant_lattice_only=False)) - len(doping_vals),
+                )
+                efield_skipped = max(
+                    0,
+                    len(_find_values("efield", dominant_lattice_only=False)) - len(efield_vals),
+                )
+            else:
+                doping_skipped = 0
+                efield_skipped = 0
         except Exception as exc:
             self.batch_preview_label.setText(f"Preview error: {exc}")
             return
@@ -2058,6 +2244,10 @@ class MainWindow(QMainWindow):
             f"Efield : {n_efield} cuts   [{_range_str(efield_vals)}]",
             f"Both   : {n_doping + n_efield} cuts total  (see log for values)",
         ]
+        if doping_skipped or efield_skipped:
+            label_lines.append(
+                f"Skipped off-lattice: Doping {doping_skipped}, Efield {efield_skipped}"
+            )
         self.batch_preview_label.setText("\n".join(label_lines))
 
         def _log_vals(label, vals):
@@ -2071,6 +2261,11 @@ class MainWindow(QMainWindow):
                 self._append_log("  " + ",  ".join(f"{v:.3f}" for v in chunk), "info")
 
         self._append_log(f"── Batch preview  (epsilon={epsilon}) ──", "info")
+        if doping_skipped or efield_skipped:
+            self._append_log(
+                f"Skipped off-lattice batch cuts: Doping {doping_skipped}, Efield {efield_skipped}",
+                "info",
+            )
         _log_vals("Doping", doping_vals)
         _log_vals("Efield", efield_vals)
 
@@ -2256,7 +2451,9 @@ class MainWindow(QMainWindow):
                 self._suppress_intensity_tracking = False
                 self._intensity_defaults_csv_signature = (data.get("source_name", ""), e_lo, e_hi, self.state.spectral_channel_count)
             
-            if not self._baseline_user_modified:
+            if self.auto_baseline_check.isChecked() and self.state.mode != "Reflection":
+                self._estimate_and_apply_baseline(log=True, mark_dirty=False)
+            elif not self._baseline_user_modified:
                 self._suppress_baseline_tracking = True
                 self.baseline_spin.setValue(595.0)
                 self._suppress_baseline_tracking = False
@@ -2455,7 +2652,7 @@ class MainWindow(QMainWindow):
 
         # Show/hide baseline
         self.baseline_form_label.setVisible(not is_rc)
-        self.baseline_spin.setVisible(not is_rc)
+        self.baseline_row_widget.setVisible(not is_rc)
 
         # Show/hide RC preview sidebar controls
         for w in self._rc_sidebar_widgets:
@@ -2463,6 +2660,9 @@ class MainWindow(QMainWindow):
 
         # Set sensible default colormap
         self.map_cmap_combo.setCurrentText("RdBu_r" if is_rc else "jet")
+
+        if not is_rc and self.state.data is not None and self.auto_baseline_check.isChecked():
+            self._estimate_and_apply_baseline(log=True, mark_dirty=False)
 
         if self.state.data is not None:
             self._invalidate_from_stage(2, f"Mode switched to {mode} – maps need refresh.")
