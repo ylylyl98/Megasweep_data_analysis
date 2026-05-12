@@ -89,14 +89,107 @@ def _split_numeric_spectral_columns(columns, excluded=None):
     return metadata_cols, spectral_cols
 
 
+def normalize_axis_name(name):
+    """Normalize a column name for axis-role matching."""
+    return ''.join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def classify_axis_role(name):
+    """
+    Classify a column name as a likely sweep-axis role.
+
+    Returns one of: 'tg', 'bg', 'doping', 'efield', or 'unknown'.
+    """
+    text = normalize_axis_name(name)
+    role_tokens = [
+        ('doping', ('dopingset', 'doping', 'carrierdensity', 'carrier', 'density')),
+        ('efield', ('efieldset', 'efield', 'electricfield', 'fieldset', 'field')),
+        ('tg', ('vtg', 'topgate', 'topg', 'axisaset', 'gatea', 'tg')),
+        ('bg', ('vbg', 'backgate', 'bottomgate', 'bottomg', 'axisbset', 'gateb', 'bg')),
+    ]
+    matches = []
+    for role, tokens in role_tokens:
+        for priority, token in enumerate(tokens):
+            if token in text:
+                matches.append((len(token), -priority, role))
+                break
+    if not matches:
+        return 'unknown'
+    matches.sort(reverse=True)
+    return matches[0][2]
+
+
+def validate_axis_selection(x_name, y_name):
+    """
+    Validate selected X/Y columns against supported axis modes.
+
+    Valid raw-gate mode uses X=BG/Vbg and Y=TG/Vtg.
+    Valid transformed mode uses X=Doping and Y=Efield.
+    """
+    x_role = classify_axis_role(x_name)
+    y_role = classify_axis_role(y_name)
+    if str(x_name) == str(y_name):
+        return {
+            'ok': False,
+            'mode': 'invalid',
+            'x_role': x_role,
+            'y_role': y_role,
+            'message': 'Axis X and Axis Y cannot use the same column.',
+        }
+    if x_role == 'bg' and y_role == 'tg':
+        return {
+            'ok': True,
+            'mode': 'raw_gate',
+            'x_role': x_role,
+            'y_role': y_role,
+            'message': 'Raw gate axes detected: X=BG/Vbg, Y=TG/Vtg.',
+        }
+    if x_role == 'doping' and y_role == 'efield':
+        return {
+            'ok': True,
+            'mode': 'transformed',
+            'x_role': x_role,
+            'y_role': y_role,
+            'message': 'Transformed axes detected: X=Doping, Y=Efield.',
+        }
+    if x_role == 'tg' and y_role == 'bg':
+        return {
+            'ok': False,
+            'mode': 'swapped_raw_gate',
+            'x_role': x_role,
+            'y_role': y_role,
+            'message': 'Axis selections look swapped: use X=BG/Vbg and Y=TG/Vtg for raw gate sweeps.',
+        }
+    if x_role == 'efield' and y_role == 'doping':
+        return {
+            'ok': False,
+            'mode': 'swapped_transformed',
+            'x_role': x_role,
+            'y_role': y_role,
+            'message': 'Axis selections look swapped: use X=Doping and Y=Efield for transformed-axis files.',
+        }
+    if x_role in {'bg', 'tg'} or y_role in {'bg', 'tg'}:
+        mode = 'unknown_gate'
+        message = 'Could not confidently identify raw gate axes. Expected X=BG/Vbg and Y=TG/Vtg.'
+    elif x_role in {'doping', 'efield'} or y_role in {'doping', 'efield'}:
+        mode = 'unknown_transformed'
+        message = 'Could not confidently identify transformed axes. Expected X=Doping and Y=Efield.'
+    else:
+        mode = 'unknown'
+        message = 'Axis roles could not be identified from column names; proceeding with selected X/Y columns.'
+    return {
+        'ok': True,
+        'mode': mode,
+        'x_role': x_role,
+        'y_role': y_role,
+        'message': message,
+    }
+
+
 def _infer_axis_space(x_name, y_name):
     """Classify whether the selected axes are raw gate axes or transformed axes."""
-    labels = [
-        str(x_name).lower().replace("_", "").replace(" ", ""),
-        str(y_name).lower().replace("_", "").replace(" ", ""),
-    ]
-    transformed_tokens = ("doping", "density", "efield", "electricfield", "field")
-    if any(any(token in label for token in transformed_tokens) for label in labels):
+    roles = {classify_axis_role(x_name), classify_axis_role(y_name)}
+    if roles & {'doping', 'efield'}:
         return "transformed"
     return "gate"
 

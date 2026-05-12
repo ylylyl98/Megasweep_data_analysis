@@ -43,10 +43,12 @@ from megasweep_analysis import (
     estimate_global_baseline,
     extract_line_cut,
     find_all_cut_values,
+    classify_axis_role,
     plot_line_cut_spectrogram,
     plot_map,
     save_line_csv,
     save_map_csv,
+    validate_axis_selection,
 )
 from ui.app_state import AppState
 from ui.workers import (
@@ -619,8 +621,8 @@ class MainWindow(QMainWindow):
         ratio: float | None = None,
     ) -> None:
         mapping = (
-            f"Sweep X={self.state.selected_x_col or 'X'}, "
-            f"Sweep Y={self.state.selected_y_col or 'Y'}"
+            f"Axis X={self.state.selected_x_col or 'X'}, "
+            f"Axis Y={self.state.selected_y_col or 'Y'}"
         )
         summary = (
             f"{stage_name} payload: X{np.shape(payload['X2D'])}, Y{np.shape(payload['Y2D'])}, "
@@ -848,8 +850,16 @@ class MainWindow(QMainWindow):
 
         self.vbg_combo = QComboBox()
         self.vtg_combo = QComboBox()
-        self._sweep_x_label = QLabel("Sweep X column:")
-        self._sweep_y_label = QLabel("Sweep Y column:")
+        axis_help = (
+            "Raw gate sweeps: Axis X should be BG/Vbg and Axis Y should be TG/Vtg. "
+            "Transformed files: Axis X should be doping and Axis Y should be efield."
+        )
+        self.vbg_combo.setToolTip(axis_help)
+        self.vtg_combo.setToolTip(axis_help)
+        self._sweep_x_label = QLabel("Axis X column:")
+        self._sweep_y_label = QLabel("Axis Y column:")
+        self._sweep_x_label.setToolTip(axis_help)
+        self._sweep_y_label.setToolTip(axis_help)
         self.vbg_combo.currentTextChanged.connect(self._on_gate_columns_changed)
         self.vtg_combo.currentTextChanged.connect(self._on_gate_columns_changed)
         form.addRow(self._sweep_x_label, self.vbg_combo)
@@ -1496,17 +1506,17 @@ class MainWindow(QMainWindow):
             return
 
         gate_columns = self._extract_gate_columns(columns)
-        vtg_guess, vbg_guess = self._guess_gate_columns(gate_columns)
+        y_guess, x_guess = self._guess_gate_columns(gate_columns)
 
         self._building_combos = True
         self.vbg_combo.clear()
         self.vtg_combo.clear()
         self.vbg_combo.addItems(gate_columns)
         self.vtg_combo.addItems(gate_columns)
-        if vbg_guess:
-            self.vbg_combo.setCurrentText(vbg_guess)
-        if vtg_guess:
-            self.vtg_combo.setCurrentText(vtg_guess)
+        if x_guess:
+            self.vbg_combo.setCurrentText(x_guess)
+        if y_guess:
+            self.vtg_combo.setCurrentText(y_guess)
         self._building_combos = False
         self._update_axis_ui_text()
 
@@ -1517,8 +1527,8 @@ class MainWindow(QMainWindow):
             self._on_output_dir_changed()
 
         self._append_log(
-            f"Headers detected. Auto-selected Sweep X={self.vbg_combo.currentText()} and "
-            f"Sweep Y={self.vtg_combo.currentText()}.",
+            f"Headers detected. Auto-selected Axis X={self.vbg_combo.currentText()} and "
+            f"Axis Y={self.vtg_combo.currentText()}. {self._axis_selection_status()['message']}",
             "info",
         )
 
@@ -1629,29 +1639,32 @@ class MainWindow(QMainWindow):
 
     # (legacy method removed – use _preview_reflection_spectra instead)
 
+    def _axis_selection_status(self) -> dict:
+        x_name = self.vbg_combo.currentText().strip() or self.state.selected_x_col or "X"
+        y_name = self.vtg_combo.currentText().strip() or self.state.selected_y_col or "Y"
+        return validate_axis_selection(x_name, y_name)
+
     def _update_axis_ui_text(self) -> None:
         x_name = self.vbg_combo.currentText().strip() or self.state.selected_x_col or "X"
         y_name = self.vtg_combo.currentText().strip() or self.state.selected_y_col or "Y"
 
-        self._sweep_x_label.setText(f"Sweep X column ({x_name}):")
-        self._sweep_y_label.setText(f"Sweep Y column ({y_name}):")
+        self._sweep_x_label.setText(f"Axis X column ({x_name}):")
+        self._sweep_y_label.setText(f"Axis Y column ({y_name}):")
         self._rc_vbg_label.setText(f"Preview {x_name}:")
         self._rc_vtg_label.setText(f"Preview {y_name}:")
 
-        axis_space = None
-        if self.state.data is not None:
-            axis_space = self.state.data.get("axis_space")
+        status = self._axis_selection_status()
+        if status["mode"] == "raw_gate":
+            mode_text = "Raw gates: X=BG/Vbg, Y=TG/Vtg"
+        elif status["mode"] == "transformed":
+            mode_text = "Transformed: X=doping, Y=efield"
+        elif status["mode"].startswith("swapped"):
+            mode_text = "Axis selection looks swapped"
         else:
-            names = [x_name.lower().replace("_", "").replace(" ", ""), y_name.lower().replace("_", "").replace(" ", "")]
-            if any(any(token in name for token in ("doping", "density", "efield", "electricfield", "field")) for name in names):
-                axis_space = "transformed"
-            else:
-                axis_space = "gate"
-
-        mode_text = "Loaded axes: D/E" if axis_space == "transformed" else "Loaded axes: gate sweep"
+            mode_text = status["message"]
         current_summary = self.summary_label.text().strip() if hasattr(self, "summary_label") else ""
-        if not current_summary or current_summary == "No CSV loaded." or current_summary.startswith("Sweep selection:"):
-            self.summary_label.setText(f"Sweep selection: X={x_name}, Y={y_name} | {mode_text}")
+        if not current_summary or current_summary == "No CSV loaded." or current_summary.startswith("Axis selection:") or current_summary.startswith("Sweep selection:"):
+            self.summary_label.setText(f"Axis selection: X={x_name}, Y={y_name} | {mode_text}")
 
     def _on_gate_columns_changed(self) -> None:
         if self._building_combos:
@@ -2032,29 +2045,28 @@ class MainWindow(QMainWindow):
         return gate_columns or columns[:2]
 
     def _guess_gate_columns(self, gate_columns: list[str]) -> tuple[str, str]:
-        def pick(keywords: list[str], exclude: str = "") -> str:
+        def pick_role(role: str, exclude: str = "") -> str:
             for column in gate_columns:
-                text = column.lower().replace("_", "").replace(" ", "")
                 if column == exclude:
                     continue
-                if any(keyword in text for keyword in keywords):
+                if classify_axis_role(column) == role:
                     return column
             for column in gate_columns:
                 if column != exclude:
                     return column
             return ""
 
-        transformed_x = pick(["doping", "density", "carrierdensity"])
-        transformed_y = pick(["efield", "electricfield", "field"], exclude=transformed_x)
+        transformed_x = pick_role("doping")
+        transformed_y = pick_role("efield", exclude=transformed_x)
         if transformed_x and transformed_y:
             return transformed_y, transformed_x
 
-        vtg = pick(["vtg", "tg", "topgate", "vg1", "gate1"])
-        vbg = pick(["vbg", "bg", "backgate", "bottomgate", "vg2", "gate2"], exclude=vtg)
+        vtg = pick_role("tg")
+        vbg = pick_role("bg", exclude=vtg)
         if not vbg:
-            vbg = pick([], exclude=vtg)
+            vbg = pick_role("unknown", exclude=vtg)
         if not vtg:
-            vtg = pick([], exclude=vbg)
+            vtg = pick_role("unknown", exclude=vbg)
         return vtg, vbg
 
     def _collect_line_specs(self) -> list[dict]:
@@ -2108,14 +2120,26 @@ class MainWindow(QMainWindow):
             self._append_log("Select both sweep-axis columns before loading.", "error")
             return
 
+        axis_status = validate_axis_selection(vbg, vtg)
+        if not axis_status["ok"]:
+            self._append_log(axis_status["message"], "error")
+            QMessageBox.warning(self, "Axis Selection", axis_status["message"])
+            return
+        if axis_status["mode"].startswith("unknown"):
+            self._append_log(axis_status["message"], "warn")
+
         self.state.csv_path = csv_path
         csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
         self.state.output_dir = os.path.join(os.path.dirname(csv_path), f"{csv_stem}_outputs")
         self.out_edit.setText(self.state.output_dir)
         self.state.selected_x_col = vbg
         self.state.selected_y_col = vtg
-        self.state.selected_bg_col = vbg
-        self.state.selected_tg_col = vtg
+        if axis_status["mode"] == "raw_gate":
+            self.state.selected_bg_col = vbg
+            self.state.selected_tg_col = vtg
+        else:
+            self.state.selected_bg_col = ""
+            self.state.selected_tg_col = ""
 
         worker = CsvLoadWorker(csv_path, x_col=vbg, y_col=vtg)
         self._run_worker(worker, self._on_csv_loaded, context="Loading CSV")
@@ -2463,7 +2487,13 @@ class MainWindow(QMainWindow):
                 f"E: {self.state.energy_range[0]:.3f}–{self.state.energy_range[1]:.3f} eV | "
                 f"Grid: {self.state.unique_x_count}×{self.state.unique_y_count}"
             )
+            axis_status = validate_axis_selection(data.get("x_name", ""), data.get("y_name", ""))
+            if axis_status["mode"] == "raw_gate":
+                summary_text += " | Axes: X=BG/Vbg, Y=TG/Vtg"
+            elif axis_status["mode"] == "transformed":
+                summary_text += " | Axes: X=doping, Y=efield"
             self.summary_label.setText(summary_text)
+            self._append_log(axis_status["message"], "info" if axis_status["mode"] in {"raw_gate", "transformed"} else "warn")
 
             if self.state.background_spectra is not None:
                 bg_wavelength = None if self.state.background_wavelength is None else np.asarray(self.state.background_wavelength, dtype=float)
