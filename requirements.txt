@@ -2,4 +2,5 @@ PySide6
 numpy
 pandas
 matplotlib
+Pillow
 scipy

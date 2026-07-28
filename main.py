@@ -5,7 +5,7 @@ Entry point for the Megasweep PL Analysis desktop app.
 
 Launch:
     python main.py
-or double-click launch_megasweep_pl_analysis.bat
+or double-click Megasweep Analysis.bat
 """
 
 from datetime import datetime
@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use("qtagg")
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QPalette, QColor
+from PySide6.QtGui import QIcon, QPalette, QColor
 from PySide6.QtCore import Qt
 
 # Ensure the app folder is on the path regardless of where Python is invoked from
@@ -29,6 +29,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
+APP_ICON_PATH = os.path.join(APP_DIR, "assets", "megasweep.ico")
 
 _CRASH_LOG_PATH = os.path.join(APP_DIR, "megasweep_crash.log")
 APP_ID = "YanLab.MegasweepAnalysis"
@@ -51,9 +52,14 @@ def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
     except OSError:
         pass
 
-    sys.stderr.write(message)
-    sys.stderr.flush()
-    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+    if sys.stderr is not None:
+        try:
+            sys.stderr.write(message)
+            sys.stderr.flush()
+        except OSError:
+            pass
+    if sys.stderr is not None and sys.__excepthook__ is not None:
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
 
 sys.excepthook = _log_uncaught_exception
@@ -98,8 +104,12 @@ def main():
     app.setApplicationDisplayName(APP_NAME)
     app.setStyle("Fusion")
     app.setPalette(_light_palette())
+    if os.path.isfile(APP_ICON_PATH):
+        app.setWindowIcon(QIcon(APP_ICON_PATH))
 
     window = MainWindow()
+    if not app.windowIcon().isNull():
+        window.setWindowIcon(app.windowIcon())
     window.show()
 
     sys.exit(app.exec())

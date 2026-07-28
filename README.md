@@ -7,7 +7,7 @@ Megasweep PL Analysis is a Python desktop application and script workflow for an
 ## Main Features
 
 - PySide6 desktop GUI launched from `main.py`.
-- Windows launcher (`launch_megasweep_pl_analysis.bat`) that creates a local `.venv`, installs requirements, and starts the GUI.
+- Windows launcher (`Megasweep Analysis.bat`) that creates a local `.venv`, installs requirements, creates an icon-enabled shortcut, and starts the GUI without a second console taskbar button.
 - Megasweep CSV loading with selectable X/Y sweep-axis columns.
 - Axis-role validation for raw gate axes (`X=BG/Vbg`, `Y=TG/Vtg`) and transformed axes (`X=doping`, `Y=efield`).
 - Integrated PL intensity maps over a configurable energy window.
@@ -28,7 +28,10 @@ Megasweep PL Analysis is a Python desktop application and script workflow for an
 +-- main.py                         # GUI entry point
 +-- megasweep_analysis.py           # Core analysis, plotting, transform, and export functions
 +-- megasweep_run.py                # Editable script workflow for batch-style analysis
-+-- launch_megasweep_pl_analysis.bat # Windows launcher and environment bootstrapper
++-- Megasweep Analysis.bat          # Windows launcher and environment bootstrapper
++-- Create_Megasweep_Shortcut.ps1   # Generates the icon-enabled Windows shortcut
++-- assets/
+|   +-- megasweep.ico               # Window, taskbar, and shortcut icon
 +-- requirements.txt                # Python package dependencies
 +-- ui/
 |   +-- __init__.py
@@ -50,6 +53,7 @@ Megasweep PL Analysis is a Python desktop application and script workflow for an
   - `numpy`
   - `pandas`
   - `matplotlib`
+  - `Pillow`
   - `scipy`
 - A megasweep CSV file with selectable sweep-axis columns and numeric spectral column headers.
 - For Reflection mode: one or more matching background CSV files with the same spectral channels as the primary data.
@@ -63,7 +67,7 @@ Package versions are not pinned in this repository. Exact supported versions are
 From the project folder, run:
 
 ```bat
-launch_megasweep_pl_analysis.bat
+Megasweep Analysis.bat
 ```
 
 The launcher:
@@ -72,7 +76,15 @@ The launcher:
 2. Creates `.venv` if it does not already exist.
 3. Upgrades `pip`.
 4. Installs packages from `requirements.txt`.
-5. Starts the GUI application.
+5. Creates `Megasweep Analysis.lnk` with the application icon.
+6. Starts the GUI through `pythonw.exe`, avoiding a second console taskbar button.
+
+The generated shortcut can be copied elsewhere or pinned to the taskbar. To
+create an additional desktop shortcut, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Create_Megasweep_Shortcut.ps1 -Desktop
+```
 
 ### Option 2: Manual Setup
 

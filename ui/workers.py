@@ -18,9 +18,11 @@ from megasweep_analysis import (
     extract_line_cut,
     find_all_cut_values,
     load_megasweep_csv,
+    load_spectral_csv,
     plot_line_cut_spectrogram,
     save_figure,
     save_line_csv,
+    spectral_axes_match,
 )
 
 
@@ -80,15 +82,11 @@ class BackgroundLoadWorker(BaseWorker):
     def __init__(
         self,
         csv_paths: list[str],
-        x_col: str,
-        y_col: str,
         average_mode: str = "all_frames",
         expected_wavelength=None,
     ):
         super().__init__()
         self.csv_paths = list(csv_paths)
-        self.x_col = x_col
-        self.y_col = y_col
         self.average_mode = average_mode
         self.expected_wavelength = None if expected_wavelength is None else np.asarray(expected_wavelength, dtype=float)
 
@@ -113,7 +111,9 @@ class BackgroundLoadWorker(BaseWorker):
         reference_energy = None
         total_spectra = 0
         for index, csv_path in enumerate(self.csv_paths, start=1):
-            data = load_megasweep_csv(csv_path, x_col=self.x_col, y_col=self.y_col)
+            # Background metadata often differs from the primary sweep. Only
+            # its numeric wavelength channels and spectra are relevant.
+            data = load_spectral_csv(csv_path)
             wavelength = np.asarray(data["wavelength"], dtype=float)
             energy = np.asarray(data["energy"], dtype=float)
 
@@ -121,16 +121,15 @@ class BackgroundLoadWorker(BaseWorker):
                 reference_wavelength = wavelength
                 reference_energy = energy
                 if self.expected_wavelength is not None:
-                    if (
-                        wavelength.shape != self.expected_wavelength.shape
-                        or not np.allclose(wavelength, self.expected_wavelength, rtol=1e-9, atol=1e-9)
-                    ):
+                    if not spectral_axes_match(wavelength, self.expected_wavelength):
                         raise ValueError(
-                            "Background spectral channels do not match the loaded megasweep data."
+                            "Background spectral channels do not match the loaded megasweep data. "
+                            f"Background has {wavelength.size} channels spanning "
+                            f"{wavelength.min():.4f}-{wavelength.max():.4f} nm; primary data has "
+                            f"{self.expected_wavelength.size} channels spanning "
+                            f"{self.expected_wavelength.min():.4f}-{self.expected_wavelength.max():.4f} nm."
                         )
-            elif wavelength.shape != reference_wavelength.shape or not np.allclose(
-                wavelength, reference_wavelength, rtol=1e-9, atol=1e-9
-            ):
+            elif not spectral_axes_match(wavelength, reference_wavelength):
                 raise ValueError(
                     "Selected background CSV files do not share the same spectral channels."
                 )
@@ -229,7 +228,7 @@ class AnalysisRefreshWorker(BaseWorker):
                 self.log.emit("Loaded axes are already transformed; reusing them for transformed view...")
                 transformed_map = dict(original_map)
                 transformed_map["already_transformed"] = True
-            else:
+            elif axis_space == "gate":
                 self.log.emit("Computing transformed coordinate view...")
                 axis1, axis2 = compute_transformed_coords(
                     self.data["x_data"],
@@ -239,6 +238,11 @@ class AnalysisRefreshWorker(BaseWorker):
                     convention=self.convention,
                 )
                 transformed_map = build_map_payload(axis1, axis2, intensity_flat)
+            else:
+                raise ValueError(
+                    "D/E transformed views require BG/TG gate axes or loaded "
+                    "Doping/Efield axes. Use the Original view for this sweep."
+                )
             transformed_map["ratio"] = self.ratio
             transformed_map["convention"] = self.convention
             payload["transformed_map"] = transformed_map

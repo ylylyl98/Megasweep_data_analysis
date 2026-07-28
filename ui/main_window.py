@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
+from matplotlib.widgets import SpanSelector
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QSpinBox,
     QTabWidget,
@@ -43,11 +45,13 @@ from megasweep_analysis import (
     estimate_global_baseline,
     extract_line_cut,
     find_all_cut_values,
-    classify_axis_role,
+    guess_sweep_axis_columns,
     plot_line_cut_spectrogram,
     plot_map,
     save_line_csv,
     save_map_csv,
+    save_figure,
+    spectral_axes_match,
     validate_axis_selection,
 )
 from ui.app_state import AppState
@@ -431,6 +435,7 @@ class CollapsibleSection(QFrame):
         self.toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         self.toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.toggle.setProperty("class", "sectionToggle")
+        self.toggle.setMinimumHeight(36)
         self.toggle.clicked.connect(self._on_toggled)
         layout.addWidget(self.toggle)
 
@@ -445,6 +450,11 @@ class CollapsibleSection(QFrame):
     def _on_toggled(self, checked: bool) -> None:
         self.toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
         self.body.setVisible(checked)
+
+    def set_expanded(self, expanded: bool) -> None:
+        """Expand/collapse the section without relying on a synthetic click."""
+        self.toggle.setChecked(expanded)
+        self._on_toggled(expanded)
 
 
 class PlotTab(QWidget):
@@ -559,6 +569,7 @@ class MainWindow(QMainWindow):
         self._suppress_baseline_tracking = False
         self._background_paths: list[str] = []
         self._reflection_preview_message: str | None = None
+        self._rc_span_selector = None
         self._dirty_views = {
             "intensity_original": True,
             "intensity_transformed": True,
@@ -653,34 +664,59 @@ class MainWindow(QMainWindow):
 
         self.main_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.setHandleWidth(8)
+        self.main_splitter.setChildrenCollapsible(False)
 
         self.left_panel = QWidget()
         self.left_panel.setObjectName("SidebarPanel")
-        self.left_panel.setMinimumWidth(320)
-        self.left_panel.setMaximumWidth(460)
+        self.left_panel.setMinimumWidth(360)
+        self.left_panel.setMaximumWidth(620)
+        self.left_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_panel_layout = QVBoxLayout(self.left_panel)
         left_panel_layout.setContentsMargins(0, 0, 0, 0)
         left_panel_layout.setSpacing(0)
 
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QFrame.NoFrame)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setFrameShape(QFrame.NoFrame)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.sidebar_scroll.verticalScrollBar().setSingleStep(24)
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(2, 2, 8, 2)
-        left_layout.setSpacing(12)
-        left_layout.addWidget(CollapsibleSection("Data", self._build_load_group(), expanded=True))
+        left_layout.setContentsMargins(6, 6, 10, 8)
+        left_layout.setSpacing(10)
+
+        self.workflow_hint_label = QLabel(
+            "1. Load data  →  2. Choose analysis settings  →  3. Refresh a map"
+        )
+        self.workflow_hint_label.setWordWrap(True)
+        self.workflow_hint_label.setStyleSheet(
+            "color:#365b87; background:#eef5ff; border:1px solid #cfe0f5; "
+            "border-radius:8px; padding:9px 10px; font-weight:600;"
+        )
+        left_layout.addWidget(self.workflow_hint_label)
+
+        self.data_section = CollapsibleSection("1  Data", self._build_load_group(), expanded=True)
+        left_layout.addWidget(self.data_section)
         self.bg_section = CollapsibleSection("Background", self._build_background_group(), expanded=False)
         self.bg_section.setVisible(False)
         left_layout.addWidget(self.bg_section)
-        left_layout.addWidget(CollapsibleSection("Analysis Settings", self._build_analysis_group(), expanded=True))
-        left_layout.addWidget(CollapsibleSection("Line Cuts", self._build_linecuts_group(), expanded=False))
-        left_layout.addWidget(CollapsibleSection("Export", self._build_export_group(), expanded=False))
+        self.analysis_section = CollapsibleSection(
+            "2  Analysis Settings", self._build_analysis_group(), expanded=True
+        )
+        left_layout.addWidget(self.analysis_section)
+        self.linecuts_section = CollapsibleSection(
+            "3  Line Cuts", self._build_linecuts_group(), expanded=False
+        )
+        left_layout.addWidget(self.linecuts_section)
+        self.export_section = CollapsibleSection(
+            "4  Export", self._build_export_group(), expanded=False
+        )
+        left_layout.addWidget(self.export_section)
         left_layout.addStretch()
-        left_scroll.setWidget(left_widget)
-        left_panel_layout.addWidget(left_scroll, 1)
+        self.sidebar_scroll.setWidget(left_widget)
+        left_panel_layout.addWidget(self.sidebar_scroll, 1)
 
         right_splitter = QSplitter(Qt.Vertical)
 
@@ -707,7 +743,7 @@ class MainWindow(QMainWindow):
         map_row.addWidget(QLabel("Map Type"))
         self.map_type_combo = QComboBox()
         self.map_type_combo.addItems(["Intensity", "Peak Energy"])
-        self.map_type_combo.setFixedWidth(90)
+        self.map_type_combo.setFixedWidth(145)
         self.map_type_combo.currentTextChanged.connect(self._on_map_selection_changed)
         map_row.addWidget(self.map_type_combo)
         map_row.addWidget(QLabel("Axes:"))
@@ -733,9 +769,15 @@ class MainWindow(QMainWindow):
         self.refresh_current_btn.style().polish(self.refresh_current_btn)
         self.refresh_all_maps_btn = QPushButton("Refresh All Maps")
         self.refresh_all_maps_btn.clicked.connect(self._refresh_all_maps)
-        map_row.addWidget(self.refresh_current_btn)
-        map_row.addWidget(self.refresh_all_maps_btn)
         map_controls_layout.addLayout(map_row)
+
+        map_actions_row = QHBoxLayout()
+        map_actions_row.setContentsMargins(0, 0, 0, 0)
+        map_actions_row.setSpacing(8)
+        map_actions_row.addStretch()
+        map_actions_row.addWidget(self.refresh_current_btn)
+        map_actions_row.addWidget(self.refresh_all_maps_btn)
+        map_controls_layout.addLayout(map_actions_row)
 
         # ── Color scale row ───────────────────────────────────────────────
         scale_row = QHBoxLayout()
@@ -818,38 +860,53 @@ class MainWindow(QMainWindow):
         self.main_splitter.addWidget(right_splitter)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
-        self.main_splitter.setSizes([380, 900])
+        self.main_splitter.setCollapsible(0, False)
+        self.main_splitter.setSizes([430, 850])
         root.addWidget(self.main_splitter)
 
     def _build_load_group(self) -> QWidget:
         group = QWidget()
         form = QFormLayout(group)
-        form.setSpacing(8)
-        form.setContentsMargins(0, 8, 0, 0)
+        self._configure_sidebar_form(form, stacked=True)
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["PL", "Reflection"])
+        self.mode_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.mode_combo.setMinimumContentsLength(12)
+        self.mode_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
         form.addRow("Mode:", self.mode_combo)
 
         self.csv_edit = CsvDropLineEdit()
         self.csv_edit.setPlaceholderText("Select input CSV...")
+        self.csv_edit.setClearButtonEnabled(True)
+        self.csv_edit.setMinimumWidth(0)
         self.csv_edit.textChanged.connect(self._on_csv_text_changed)
         self.csv_edit.editingFinished.connect(self._on_csv_path_changed)
         self.csv_edit.csv_paths_dropped.connect(self._on_primary_csv_dropped)
-        csv_btn = QPushButton("Browse")
+        csv_btn = QPushButton("Browse…")
+        csv_btn.setToolTip("Choose the primary measurement CSV.")
         csv_btn.clicked.connect(self._browse_csv)
         form.addRow("CSV file:", self._hrow(self.csv_edit, csv_btn))
 
         self.out_edit = QLineEdit()
         self.out_edit.setPlaceholderText("Output folder...")
+        self.out_edit.setClearButtonEnabled(True)
+        self.out_edit.setMinimumWidth(0)
         self.out_edit.editingFinished.connect(self._on_output_dir_changed)
-        out_btn = QPushButton("Browse")
+        out_btn = QPushButton("Browse…")
+        out_btn.setToolTip("Choose where exported maps and line cuts are saved.")
         out_btn.clicked.connect(self._browse_output)
         form.addRow("Output dir:", self._hrow(self.out_edit, out_btn))
 
         self.vbg_combo = QComboBox()
         self.vtg_combo = QComboBox()
+        for combo in (self.vbg_combo, self.vtg_combo):
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(16)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         axis_help = (
             "Raw gate sweeps: Axis X should be BG/Vbg and Axis Y should be TG/Vtg. "
             "Transformed files: Axis X should be doping and Axis Y should be efield."
@@ -858,6 +915,8 @@ class MainWindow(QMainWindow):
         self.vtg_combo.setToolTip(axis_help)
         self._sweep_x_label = QLabel("Axis X column:")
         self._sweep_y_label = QLabel("Axis Y column:")
+        self._sweep_x_label.setWordWrap(True)
+        self._sweep_y_label.setWordWrap(True)
         self._sweep_x_label.setToolTip(axis_help)
         self._sweep_y_label.setToolTip(axis_help)
         self.vbg_combo.currentTextChanged.connect(self._on_gate_columns_changed)
@@ -878,14 +937,16 @@ class MainWindow(QMainWindow):
     def _build_background_group(self) -> QWidget:
         group = QWidget()
         form = QFormLayout(group)
-        form.setSpacing(8)
-        form.setContentsMargins(0, 8, 0, 0)
+        self._configure_sidebar_form(form, stacked=True)
         
         self.bg_csv_edit = CsvDropLineEdit(allow_multiple=True)
         self.bg_csv_edit.setPlaceholderText("Select one or more background CSVs...")
+        self.bg_csv_edit.setClearButtonEnabled(True)
+        self.bg_csv_edit.setMinimumWidth(0)
         self.bg_csv_edit.textChanged.connect(self._on_background_text_changed)
         self.bg_csv_edit.csv_paths_dropped.connect(self._on_background_csvs_dropped)
-        bg_btn = QPushButton("Browse")
+        bg_btn = QPushButton("Browse…")
+        bg_btn.setToolTip("Choose one or more reference/background CSV files.")
         bg_btn.clicked.connect(self._browse_background_csv)
         form.addRow("Background CSV:", self._hrow(self.bg_csv_edit, bg_btn))
 
@@ -893,6 +954,13 @@ class MainWindow(QMainWindow):
         self.bg_average_mode_combo.addItem("Average all frames", "all_frames")
         self.bg_average_mode_combo.addItem("Average first frame per CSV", "first_frame")
         self.bg_average_mode_combo.addItem("Average last frame per CSV", "last_frame")
+        self.bg_average_mode_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.bg_average_mode_combo.setMinimumContentsLength(16)
+        self.bg_average_mode_combo.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
         form.addRow("Background mode:", self.bg_average_mode_combo)
         
         self.load_bg_btn = QPushButton("Load Background")
@@ -909,8 +977,7 @@ class MainWindow(QMainWindow):
     def _build_analysis_group(self) -> QWidget:
         group = QWidget()
         form = QFormLayout(group)
-        form.setSpacing(6)
-        form.setContentsMargins(0, 8, 0, 0)
+        self._configure_sidebar_form(form)
         self.analysis_group = group
 
         self.int_min_spin = self._dspin(0.01, 10.0, 0.01, 3, 1.247)
@@ -919,6 +986,12 @@ class MainWindow(QMainWindow):
         self.ratio_spin = self._dspin(0.001, 100.0, 0.01, 4, 1.0)
         self.int_min_spin.valueChanged.connect(self._on_energy_window_changed)
         self.int_max_spin.valueChanged.connect(self._on_energy_window_changed)
+        energy_window_help = (
+            "Shared analysis window. In Reflection mode, preview one RC frame "
+            "and drag across its spectrum to set this range. Both RC map types use it."
+        )
+        self.int_min_spin.setToolTip(energy_window_help)
+        self.int_max_spin.setToolTip(energy_window_help)
         self.baseline_spin.valueChanged.connect(self._on_baseline_changed)
         self.ratio_spin.valueChanged.connect(self._on_ratio_changed)
         self.auto_baseline_check = QCheckBox("Auto")
@@ -942,11 +1015,16 @@ class MainWindow(QMainWindow):
         # RC preview spinboxes (separate rows so they fit the sidebar width)
         self.reflection_preview_vbg_spin = self._dspin(-1e4, 1e4, 0.1, 3, 0.0)
         self.reflection_preview_vtg_spin = self._dspin(-1e4, 1e4, 0.1, 3, 0.0)
-        self.preview_rc_btn = QPushButton("Preview RC Spectrum")
+        self.preview_rc_btn = QPushButton("Preview One RC Frame")
         self.preview_rc_btn.clicked.connect(self._preview_reflection_spectra)
+        self.preview_rc_btn.setToolTip(
+            "Plot the RC spectrum for the nearest X/Y frame. Drag horizontally "
+            "on the plot to set the shared energy window."
+        )
 
         self.reflection_preview_status_label = QLabel(
-            "Load CSV + background, then preview an RC spectrum at the chosen sweep coordinates."
+            "Load CSV + background, choose X/Y, then preview one RC frame. "
+            "Drag across the spectrum to set the map energy window."
         )
         self.reflection_preview_status_label.setWordWrap(True)
         self.reflection_preview_status_label.setStyleSheet("color:#5a7088;")
@@ -956,6 +1034,11 @@ class MainWindow(QMainWindow):
             "D = TG + r·BG,  E = TG − r·BG",
             "D = r·TG + BG,  E = r·TG − BG",
         ])
+        self.convention_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.convention_combo.setMinimumContentsLength(12)
+        self.convention_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.convention_combo.currentIndexChanged.connect(self._on_convention_changed)
 
         self.formula_label = QLabel(self._formula_text())
@@ -972,10 +1055,14 @@ class MainWindow(QMainWindow):
 
         # Baseline row – keep a reference so we can hide it in Reflection mode
         self.baseline_form_label = QLabel("Baseline:")
-        self.baseline_row_widget = self._hrow(
-            self.baseline_spin,
-            self.auto_baseline_check,
-            self.estimate_baseline_btn,
+        self.baseline_row_widget = QWidget()
+        baseline_layout = QVBoxLayout(self.baseline_row_widget)
+        baseline_layout.setContentsMargins(0, 0, 0, 0)
+        baseline_layout.setSpacing(4)
+        self.baseline_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        baseline_layout.addWidget(self.baseline_spin)
+        baseline_layout.addWidget(
+            self._hrow(self.auto_baseline_check, self.estimate_baseline_btn)
         )
         form.addRow(self.baseline_form_label, self.baseline_row_widget)
 
@@ -1031,9 +1118,11 @@ class MainWindow(QMainWindow):
         self.save_lines_csv_btn = QPushButton("Save Line-Cut CSVs")
         self.save_lines_csv_btn.clicked.connect(self._save_lines_csvs)
 
-        layout.addWidget(self._hrow(self.save_current_png_btn, self.save_current_csv_btn))
+        layout.addWidget(self.save_current_png_btn)
+        layout.addWidget(self.save_current_csv_btn)
         layout.addWidget(self.save_all_maps_btn)
-        layout.addWidget(self._hrow(self.save_lines_png_btn, self.save_lines_csv_btn))
+        layout.addWidget(self.save_lines_png_btn)
+        layout.addWidget(self.save_lines_csv_btn)
         return group
 
     def _build_intensity_group(self) -> QWidget:
@@ -1172,8 +1261,11 @@ class MainWindow(QMainWindow):
         self.batch_preview_btn.setToolTip("Count how many line cuts (and output files) each batch will produce.")
         self.batch_preview_btn.clicked.connect(self._update_batch_preview)
         eps_label = QLabel("Batch ε:")
-        layout.addWidget(self._hrow(eps_label, self.batch_epsilon_spin, self.batch_preview_btn))
-        layout.addWidget(self._hrow(self.extract_all_doping_btn, self.extract_all_efield_btn, self.extract_all_both_btn))
+        layout.addWidget(eps_label)
+        layout.addWidget(self._hrow(self.batch_epsilon_spin, self.batch_preview_btn))
+        layout.addWidget(self.extract_all_doping_btn)
+        layout.addWidget(self.extract_all_efield_btn)
+        layout.addWidget(self.extract_all_both_btn)
 
         self.batch_preview_label = QLabel("")
         self.batch_preview_label.setWordWrap(True)
@@ -1212,12 +1304,26 @@ class MainWindow(QMainWindow):
     def _hrow(*widgets) -> QWidget:
         row = QWidget()
         row.setProperty("class", "inlineRow")
+        row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         for widget in widgets:
             layout.addWidget(widget)
         return row
+
+    @staticmethod
+    def _configure_sidebar_form(form: QFormLayout, *, stacked: bool = False) -> None:
+        """Make sidebar forms responsive instead of clipping long rows."""
+        form.setContentsMargins(0, 8, 0, 0)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(
+            QFormLayout.WrapAllRows if stacked else QFormLayout.WrapLongRows
+        )
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setFormAlignment(Qt.AlignTop)
 
     @staticmethod
     def _dspin(lo: float, hi: float, step: float, decimals: int, value: float) -> QDoubleSpinBox:
@@ -1247,6 +1353,12 @@ class MainWindow(QMainWindow):
         else:
             label = "RC Peak Position" if self.state.mode == "Reflection" else "Peak Energy"
         return f"{label} on {self.map_axes_combo.currentText().lower()} axes"
+
+    def _compact_map_title(self, z_name: str) -> str:
+        """Return the approved concise title; source names stay in export filenames."""
+        e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
+        e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
+        return f"{z_name} | {e_lo:.3f}–{e_hi:.3f} eV"
 
     def _required_tasks_for_view(self, view_key: str) -> list[str]:
         match view_key:
@@ -1324,13 +1436,17 @@ class MainWindow(QMainWindow):
             self.linecuts_status_label.setText("Line cuts become available after a transformed map refresh.")
             return
 
+        supports_de = self.state.data.get("axis_space") in {"gate", "transformed"}
         dirty_names = {
             "intensity_original": "intensity/original",
-            "intensity_transformed": "intensity/transformed",
             "peak_original": "peak/original",
-            "peak_transformed": "peak/transformed",
-            "line_cuts": "line cuts",
         }
+        if supports_de:
+            dirty_names.update({
+                "intensity_transformed": "intensity/transformed",
+                "peak_transformed": "peak/transformed",
+                "line_cuts": "line cuts",
+            })
         dirty_list = [label for key, label in dirty_names.items() if self._dirty_views.get(key, False)]
         if dirty_list:
             self.analysis_status_label.setText("Needs refresh: " + ", ".join(dirty_list) + ".")
@@ -1351,7 +1467,11 @@ class MainWindow(QMainWindow):
                 f"Showing {self._current_view_description()}."
             )
 
-        if self._dirty_views.get("line_cuts", True):
+        if not supports_de:
+            self.linecuts_status_label.setText(
+                "D/E line cuts are unavailable for this sweep. Use Original maps with the loaded X/Y axes."
+            )
+        elif self._dirty_views.get("line_cuts", True):
             if self.state.data.get("axis_space") == "transformed":
                 self.linecuts_status_label.setText(
                     "Line cuts are stale or not extracted yet. Loaded D/E axes are ready for extraction."
@@ -1373,6 +1493,12 @@ class MainWindow(QMainWindow):
         if not self._validate_reflection_background_ready():
             return
         view_key = self._current_view_key()
+        if view_key.endswith("_transformed") and self.state.data.get("axis_space") == "generic":
+            self._append_log(
+                "D/E transformed views are unavailable for this sweep. Select Original axes.",
+                "warn",
+            )
+            return
         tasks = self._required_tasks_for_view(view_key)
         self._start_analysis_refresh(tasks, f"Refreshing {self._current_view_description()}")
 
@@ -1385,12 +1511,9 @@ class MainWindow(QMainWindow):
             return
         if not self._validate_reflection_background_ready():
             return
-        tasks = [
-            "intensity_original",
-            "intensity_transformed",
-            "peak_original",
-            "peak_transformed",
-        ]
+        tasks = ["intensity_original", "peak_original"]
+        if self.state.data.get("axis_space") in {"gate", "transformed"}:
+            tasks.extend(["intensity_transformed", "peak_transformed"])
         self._start_analysis_refresh(tasks, "Refreshing all map views")
 
     def _start_analysis_refresh(self, tasks: list[str], context: str) -> None:
@@ -1416,27 +1539,33 @@ class MainWindow(QMainWindow):
         if payload is None or figure is None:
             self._append_log("The selected map view has not been generated yet.", "warn")
             return
-        base = self._ensure_output_dir()
-        source = self.state.data["source_name"]
-        axes_suffix = payload.get("target_axes", "original")
-        z_name = payload["z_name"]
-        e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
-        e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
-        e_tag = f"_{e_lo:.3f}to{e_hi:.3f}eV"
-        path = os.path.join(base, f"{source}_{z_name}{e_tag}_{axes_suffix}.{output_type}")
-        if output_type == "png":
-            figure.savefig(path, dpi=300, bbox_inches="tight", transparent=True)
-        else:
-            save_map_csv(
-                payload["X2D"],
-                payload["Y2D"],
-                payload["Z2D"],
-                path,
-                x_name=payload["x_name"],
-                y_name=payload["y_name"],
-                z_name=payload["z_name"],
-            )
-        self._append_log(f"Saved {os.path.basename(path)}", "success")
+        path = ""
+        try:
+            base = self._ensure_output_dir()
+            source = self.state.data["source_name"]
+            axes_suffix = payload.get("target_axes", "original")
+            z_name = payload["z_name"]
+            e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
+            e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
+            e_tag = f"_{e_lo:.3f}to{e_hi:.3f}eV"
+            path = os.path.join(base, f"{source}_{z_name}{e_tag}_{axes_suffix}.{output_type}")
+            if output_type == "png":
+                save_figure(figure, path, dpi=300)
+            else:
+                save_map_csv(
+                    payload["X2D"],
+                    payload["Y2D"],
+                    payload["Z2D"],
+                    path,
+                    x_name=payload["x_name"],
+                    y_name=payload["y_name"],
+                    z_name=payload["z_name"],
+                )
+        except Exception as exc:
+            target = path or self.out_edit.text().strip() or "the selected output directory"
+            self._append_log(f"Save failed for {target}: {exc}", "error")
+            return
+        self._append_log(f"Saved {output_type.upper()}: {path}", "success")
 
     def _save_all_maps(self) -> None:
         saved_any = False
@@ -1495,6 +1624,7 @@ class MainWindow(QMainWindow):
 
     def _on_csv_path_changed(self) -> None:
         path = self.csv_edit.text().strip()
+        self.csv_edit.setToolTip(path)
         if not path or not os.path.isfile(path):
             self._refresh_stage_states()
             return
@@ -1537,7 +1667,8 @@ class MainWindow(QMainWindow):
         else:
             self._refresh_stage_states()
 
-    def _on_csv_text_changed(self, _text: str) -> None:
+    def _on_csv_text_changed(self, text: str) -> None:
+        self.csv_edit.setToolTip(text.strip())
         self._refresh_stage_states()
 
     def _on_primary_csv_dropped(self, paths: list[str]) -> None:
@@ -1547,6 +1678,10 @@ class MainWindow(QMainWindow):
 
     def _on_output_dir_changed(self) -> None:
         self.state.output_dir = self.out_edit.text().strip()
+        self.out_edit.setToolTip(self.state.output_dir)
+        self.open_folder_btn.setToolTip(
+            f"Open {self.state.output_dir}" if self.state.output_dir else ""
+        )
         self.open_folder_btn.setEnabled(bool(self.state.output_dir))
 
     @staticmethod
@@ -1580,6 +1715,7 @@ class MainWindow(QMainWindow):
         if not normalized_paths:
             return
         self.csv_edit.setText(normalized_paths[0])
+        self.csv_edit.setToolTip(normalized_paths[0])
         self._on_csv_path_changed()
 
     def _set_background_paths(self, paths: list[str]) -> None:
@@ -1634,8 +1770,56 @@ class MainWindow(QMainWindow):
 
     def _clear_reflection_preview(self) -> None:
         self._reflection_preview_message = None
+        self._rc_span_selector = None
         if self.state.figures.get("line_cuts") is None:
             self.line_plot_tab.clear()
+
+    def _configure_reflection_preview_coordinates(self) -> None:
+        """Set useful coordinate ranges/defaults for selecting one RC frame."""
+        if self.state.data is None:
+            return
+        for values, spin in (
+            (self.state.data["x_data"], self.reflection_preview_vbg_spin),
+            (self.state.data["y_data"], self.reflection_preview_vtg_spin),
+        ):
+            array = np.asarray(values, dtype=float).reshape(-1)
+            finite = array[np.isfinite(array)]
+            if finite.size == 0:
+                continue
+            spin.setRange(float(np.min(finite)), float(np.max(finite)))
+            unique = np.unique(finite)
+            if unique.size > 1:
+                positive_steps = np.diff(unique)
+                positive_steps = positive_steps[positive_steps > 0]
+                if positive_steps.size:
+                    spin.setSingleStep(float(np.median(positive_steps)))
+            spin.setValue(float(finite[0]))
+
+    def _on_rc_energy_span_selected(self, e_min: float, e_max: float) -> None:
+        """Apply a dragged RC-preview span as the shared map energy window."""
+        if self.state.data is None or not np.isfinite(e_min) or not np.isfinite(e_max):
+            return
+        lo, hi = sorted((float(e_min), float(e_max)))
+        energy = np.asarray(self.state.data["energy"], dtype=float)
+        finite = energy[np.isfinite(energy)]
+        if finite.size == 0:
+            return
+        lo = max(lo, float(np.min(finite)))
+        hi = min(hi, float(np.max(finite)))
+        if hi <= lo:
+            return
+
+        self._suppress_intensity_tracking = True
+        self.int_min_spin.setValue(lo)
+        self.int_max_spin.setValue(hi)
+        self._suppress_intensity_tracking = False
+        self._intensity_range_user_modified = True
+        self._on_energy_window_changed()
+        self._append_log(
+            f"RC analysis window selected from preview: {lo:.4f}-{hi:.4f} eV. "
+            "Peak-to-peak and peak-position maps will use this range.",
+            "success",
+        )
 
     # (legacy method removed – use _preview_reflection_spectra instead)
 
@@ -1658,6 +1842,10 @@ class MainWindow(QMainWindow):
             mode_text = "Raw gates: X=BG/Vbg, Y=TG/Vtg"
         elif status["mode"] == "transformed":
             mode_text = "Transformed: X=doping, Y=efield"
+        elif status["mode"] == "doping_bias":
+            mode_text = "Sweep: X=doping, Y=Vbias"
+        elif status["mode"] == "generic_sweep":
+            mode_text = "Explicit acquisition sweep axes"
         elif status["mode"].startswith("swapped"):
             mode_text = "Axis selection looks swapped"
         else:
@@ -1716,12 +1904,22 @@ class MainWindow(QMainWindow):
 
         # ── Smoothed spectrum ─────────────────────────────────────────────
         n_pts = spectrum.size
-        win = min(21, n_pts if n_pts % 2 == 1 else n_pts - 1)
-        win = max(5, win)
-        if win >= n_pts:
-            win = n_pts if n_pts % 2 == 1 else n_pts - 1
+        win = min(
+            int(self.sg_window_spin.value()),
+            n_pts if n_pts % 2 == 1 else n_pts - 1,
+        )
+        if win % 2 == 0:
+            win -= 1
+        poly = min(int(self.sg_poly_spin.value()), max(0, win - 1))
         try:
-            spectrum_smooth = _sgf(spectrum, window_length=win, polyorder=2, mode="interp")
+            if win < 3:
+                raise ValueError("Not enough spectral channels for smoothing.")
+            spectrum_smooth = _sgf(
+                spectrum,
+                window_length=win,
+                polyorder=poly,
+                mode="interp",
+            )
         except Exception:
             spectrum_smooth = spectrum.copy()
 
@@ -1741,7 +1939,14 @@ class MainWindow(QMainWindow):
 
         # ── Peak position (dominant feature) ─────────────────────────────
         try:
-            pk_energy, pk_value = _rc_peak_pos(energy, spectrum, e_lo, e_hi)
+            pk_energy, pk_value = _rc_peak_pos(
+                energy,
+                spectrum,
+                e_lo,
+                e_hi,
+                sg_window=self.sg_window_spin.value(),
+                sg_poly=self.sg_poly_spin.value(),
+            )
         except Exception:
             pk_energy, pk_value = float("nan"), float("nan")
 
@@ -1784,13 +1989,23 @@ class MainWindow(QMainWindow):
         fig.tight_layout()
 
         self.line_plot_tab.set_figure(fig)
+        self._rc_span_selector = SpanSelector(
+            ax,
+            self._on_rc_energy_span_selected,
+            "horizontal",
+            useblit=True,
+            props={"facecolor": "#f59e0b", "alpha": 0.2},
+            minspan=1e-6,
+            interactive=True,
+        )
         self.workspace_tabs.setCurrentIndex(1)
 
         p2p_str = f"{rc_p2p:.4f}" if np.isfinite(rc_p2p) else "n/a"
         pk_str = f"{pk_energy:.4f} eV" if np.isfinite(pk_energy) else "n/a"
         self._reflection_preview_message = (
             f"RC preview: {x_label}={actual_x:.3f}, {y_label}={actual_y:.3f} | "
-            f"P2P={p2p_str} | Peak={pk_str}"
+            f"Window={e_lo:.4f}-{e_hi:.4f} eV | P2P={p2p_str} | Peak={pk_str}. "
+            "Drag horizontally to change the window."
         )
         self.reflection_preview_status_label.setText(self._reflection_preview_message)
 
@@ -1801,14 +2016,31 @@ class MainWindow(QMainWindow):
         self.state.transformed_map = None
         self.state.figures.pop("original_map", None)
         self.state.figures.pop("transformed_map", None)
-        self._mark_dirty("intensity_original", "intensity_transformed")
+        if self.state.mode == "Reflection":
+            self.state.peak_map_original = None
+            self.state.peak_map_transformed = None
+            self.state.figures.pop("peak_map_original", None)
+            self.state.figures.pop("peak_map_transformed", None)
+            self._mark_dirty(
+                "intensity_original",
+                "intensity_transformed",
+                "peak_original",
+                "peak_transformed",
+            )
+            message = (
+                "RC energy window changed. Peak-to-peak and peak-position views need refresh."
+            )
+        else:
+            self._mark_dirty("intensity_original", "intensity_transformed")
+            message = "Intensity settings changed. Intensity views need refresh."
         self._show_current_map_view()
-        self._append_log("Intensity settings changed. Intensity views need refresh.", "warn")
+        self._append_log(message, "warn")
         self._refresh_stage_states()
 
     def _on_energy_window_changed(self) -> None:
-        if not self._suppress_intensity_tracking:
-            self._intensity_range_user_modified = True
+        if self._suppress_intensity_tracking:
+            return
+        self._intensity_range_user_modified = True
         if self.state.mode == "Reflection":
             if self._reflection_preview_message is not None:
                 # A preview is already visible — refresh it in-place with the new energy window
@@ -1946,6 +2178,8 @@ class MainWindow(QMainWindow):
     def _on_peak_settings_changed(self) -> None:
         if self.state.data is None:
             return
+        if self.state.mode == "Reflection" and self._reflection_preview_message is not None:
+            self._preview_reflection_spectra()
         self.state.peak_map_original = None
         self.state.peak_map_transformed = None
         self.state.figures.pop("peak_map_original", None)
@@ -2045,29 +2279,10 @@ class MainWindow(QMainWindow):
         return gate_columns or columns[:2]
 
     def _guess_gate_columns(self, gate_columns: list[str]) -> tuple[str, str]:
-        def pick_role(role: str, exclude: str = "") -> str:
-            for column in gate_columns:
-                if column == exclude:
-                    continue
-                if classify_axis_role(column) == role:
-                    return column
-            for column in gate_columns:
-                if column != exclude:
-                    return column
-            return ""
-
-        transformed_x = pick_role("doping")
-        transformed_y = pick_role("efield", exclude=transformed_x)
-        if transformed_x and transformed_y:
-            return transformed_y, transformed_x
-
-        vtg = pick_role("tg")
-        vbg = pick_role("bg", exclude=vtg)
-        if not vbg:
-            vbg = pick_role("unknown", exclude=vtg)
-        if not vtg:
-            vtg = pick_role("unknown", exclude=vbg)
-        return vtg, vbg
+        x_guess, y_guess = guess_sweep_axis_columns(gate_columns)
+        # Historical return order is (Y, X) because the combo attributes retain
+        # their original vtg/vbg names.
+        return y_guess, x_guess
 
     def _collect_line_specs(self) -> list[dict]:
         specs = []
@@ -2130,8 +2345,19 @@ class MainWindow(QMainWindow):
 
         self.state.csv_path = csv_path
         csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
-        self.state.output_dir = os.path.join(os.path.dirname(csv_path), f"{csv_stem}_outputs")
+        requested_output_dir = self.out_edit.text().strip()
+        if requested_output_dir:
+            self.state.output_dir = os.path.abspath(
+                os.path.expanduser(requested_output_dir)
+            )
+        else:
+            self.state.output_dir = os.path.join(
+                os.path.dirname(csv_path),
+                f"{csv_stem}_outputs",
+            )
         self.out_edit.setText(self.state.output_dir)
+        self.out_edit.setToolTip(self.state.output_dir)
+        self.open_folder_btn.setToolTip(f"Open {self.state.output_dir}")
         self.state.selected_x_col = vbg
         self.state.selected_y_col = vtg
         if axis_status["mode"] == "raw_gate":
@@ -2164,6 +2390,13 @@ class MainWindow(QMainWindow):
         if self.state.original_map is None:
             self._append_log("Plot the original intensity map first.", "error")
             return
+        if self.state.data.get("axis_space") not in {"gate", "transformed"}:
+            self._append_log(
+                "D/E transformed views require BG/TG or Doping/Efield axes. "
+                "Use the Original view for this sweep.",
+                "warn",
+            )
+            return
         worker = TransformWorker(
             self.state.original_map,
             self.ratio_spin.value(),
@@ -2194,6 +2427,12 @@ class MainWindow(QMainWindow):
     def _start_line_stage(self) -> None:
         if self.state.data is None:
             self._append_log("Load a CSV before extracting line cuts.", "error")
+            return
+        if self.state.data.get("axis_space") not in {"gate", "transformed"}:
+            self._append_log(
+                "D/E line cuts are unavailable for this sweep. Use Original maps with the loaded X/Y axes.",
+                "warn",
+            )
             return
         if not self._validate_reflection_background_ready():
             return
@@ -2421,6 +2660,8 @@ class MainWindow(QMainWindow):
             self.state.output_dir = output_dir
             os.makedirs(output_dir, exist_ok=True)
             self.out_edit.setText(output_dir)
+            self.out_edit.setToolTip(output_dir)
+            self.open_folder_btn.setToolTip(f"Open {output_dir}")
             return output_dir
         raise ValueError("No output directory set and no CSV loaded.")
 
@@ -2438,6 +2679,12 @@ class MainWindow(QMainWindow):
 
     def _invalidate_from_stage(self, stage_number: int, message: str) -> None:
         self.state.reset_from_stage(stage_number)
+        if stage_number <= 1:
+            x_name = self.vbg_combo.currentText().strip() or "X"
+            y_name = self.vtg_combo.currentText().strip() or "Y"
+            self.summary_label.setText(
+                f"Axis selection: X={x_name}, Y={y_name} | Reload the CSV to apply this selection."
+            )
         self._dirty_views = {k: True for k in self._dirty_views.keys()}
         self._clear_reflection_preview()
         for plot_tab in [self.map_plot_tab, self.line_plot_tab]:
@@ -2449,7 +2696,7 @@ class MainWindow(QMainWindow):
         try:
             data = result["data"]
             self.state.data = data
-            self.state.csv_path = data.get("source_name", "")
+            self.state.csv_path = data.get("source_path", self.state.csv_path)
             
             x_data = data["x_data"]
             y_data = data["y_data"]
@@ -2461,6 +2708,7 @@ class MainWindow(QMainWindow):
             self.state.energy_range = (float(np.min(energy)), float(np.max(energy)))
             self.state.unique_x_count = len(np.unique(x_data))
             self.state.unique_y_count = len(np.unique(y_data))
+            self._configure_reflection_preview_coordinates()
             
             if not self._intensity_range_user_modified:
                 energy_sorted = np.sort(energy[np.isfinite(energy)])
@@ -2492,16 +2740,38 @@ class MainWindow(QMainWindow):
                 summary_text += " | Axes: X=BG/Vbg, Y=TG/Vtg"
             elif axis_status["mode"] == "transformed":
                 summary_text += " | Axes: X=doping, Y=efield"
+            elif axis_status["mode"] == "doping_bias":
+                summary_text += " | Axes: X=doping, Y=Vbias"
+            elif axis_status["mode"] == "generic_sweep":
+                summary_text += (
+                    f" | Axes: X={data.get('x_name', 'X')}, Y={data.get('y_name', 'Y')}"
+                )
             self.summary_label.setText(summary_text)
-            self._append_log(axis_status["message"], "info" if axis_status["mode"] in {"raw_gate", "transformed"} else "warn")
+            known_axis_modes = {"raw_gate", "transformed", "doping_bias", "generic_sweep"}
+            self._append_log(
+                axis_status["message"],
+                "info" if axis_status["mode"] in known_axis_modes else "warn",
+            )
+
+            supports_de = data.get("axis_space") in {"gate", "transformed"}
+            transformed_index = self.map_axes_combo.findText("Transformed")
+            if transformed_index >= 0:
+                transformed_item = self.map_axes_combo.model().item(transformed_index)
+                if transformed_item is not None:
+                    transformed_item.setEnabled(supports_de)
+                    transformed_item.setToolTip(
+                        "" if supports_de
+                        else "D/E transformed views require BG/TG or Doping/Efield axes."
+                    )
+            if not supports_de:
+                self.map_axes_combo.setCurrentText("Original")
 
             if self.state.background_spectra is not None:
                 bg_wavelength = None if self.state.background_wavelength is None else np.asarray(self.state.background_wavelength, dtype=float)
                 data_wavelength = np.asarray(data["wavelength"], dtype=float)
                 if (
                     bg_wavelength is None
-                    or bg_wavelength.shape != data_wavelength.shape
-                    or not np.allclose(bg_wavelength, data_wavelength, rtol=1e-9, atol=1e-9)
+                    or not spectral_axes_match(bg_wavelength, data_wavelength)
                 ):
                     self._clear_background_state("Background cleared: reload a matching background for this dataset.")
                     self._append_log(
@@ -2513,6 +2783,13 @@ class MainWindow(QMainWindow):
             self._dirty_views = {k: True for k in self._dirty_views.keys()}
             self._refresh_stage_states()
             self._append_log(f"CSV loaded: {data.get('source_name', 'unknown')}", "success")
+            self.data_section.set_expanded(False)
+            if self.state.mode == "Reflection":
+                self.bg_section.set_expanded(True)
+                self.sidebar_scroll.ensureWidgetVisible(self.bg_section, 0, 16)
+            else:
+                self.analysis_section.set_expanded(True)
+                self.sidebar_scroll.ensureWidgetVisible(self.analysis_section, 0, 16)
         except Exception:
             self._append_log(traceback.format_exc(), "error")
 
@@ -2522,10 +2799,6 @@ class MainWindow(QMainWindow):
             vmin_val = None if self.map_auto_scale_check.isChecked() else self.map_vmin_spin.value()
             vmax_val = None if self.map_auto_scale_check.isChecked() else self.map_vmax_spin.value()
             is_rc = self.state.mode == "Reflection"
-            e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
-            e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
-            e_suffix = f" | {e_lo:.3f}–{e_hi:.3f} eV"
-
             for map_key, map_data in payload.items():
                 if map_key not in ["original_map", "transformed_map", "peak_map_original", "peak_map_transformed"]:
                     continue
@@ -2539,8 +2812,7 @@ class MainWindow(QMainWindow):
                         y_name = self.state.data.get("y_name", "y")
                         z_name = "RC Peak-to-Peak" if is_rc else "PL Intensity"
                         z_label = "RC Amplitude (a.u.)" if is_rc else "PL Intensity (a.u.)"
-                        source = self.state.data.get("source_name", "data")
-                        title = f"{z_name} Map | {source}{e_suffix}"
+                        title = self._compact_map_title(z_name)
                         self._dirty_views["intensity_original"] = False
                         figure_key = "original_map"
 
@@ -2553,11 +2825,7 @@ class MainWindow(QMainWindow):
                             x_name, y_name = self._axis_labels()
                         z_name = "RC Peak-to-Peak" if is_rc else "PL Intensity"
                         z_label = "RC Amplitude (a.u.)" if is_rc else "PL Intensity (a.u.)"
-                        ratio = map_data.get("ratio", self.ratio_spin.value())
-                        if self.state.data.get("axis_space") == "transformed":
-                            title = f"{z_name} Map | Loaded transformed axes{e_suffix}"
-                        else:
-                            title = f"{z_name} Map | Transformed (ratio={ratio:.4g}){e_suffix}"
+                        title = self._compact_map_title(z_name)
                         self._dirty_views["intensity_transformed"] = False
                         figure_key = "transformed_map"
 
@@ -2567,8 +2835,7 @@ class MainWindow(QMainWindow):
                         y_name = self.state.data.get("y_name", "y")
                         z_name = "RC Peak Position" if is_rc else "Peak Energy"
                         z_label = "RC Peak Position (eV)" if is_rc else "Peak Energy (eV)"
-                        source = self.state.data.get("source_name", "data")
-                        title = f"{z_name} Map | {source}{e_suffix}"
+                        title = self._compact_map_title(z_name)
                         self._dirty_views["peak_original"] = False
                         figure_key = "peak_map_original"
 
@@ -2581,11 +2848,7 @@ class MainWindow(QMainWindow):
                             x_name, y_name = self._axis_labels()
                         z_name = "RC Peak Position" if is_rc else "Peak Energy"
                         z_label = "RC Peak Position (eV)" if is_rc else "Peak Energy (eV)"
-                        ratio = map_data.get("ratio", self.ratio_spin.value())
-                        if self.state.data.get("axis_space") == "transformed":
-                            title = f"{z_name} Map | Loaded transformed axes{e_suffix}"
-                        else:
-                            title = f"{z_name} Map | Transformed (ratio={ratio:.4g}){e_suffix}"
+                        title = self._compact_map_title(z_name)
                         self._dirty_views["peak_transformed"] = False
                         figure_key = "peak_map_transformed"
 
@@ -2642,8 +2905,6 @@ class MainWindow(QMainWindow):
         mode = self.bg_average_mode_combo.currentData() or "all_frames"
         worker = BackgroundLoadWorker(
             paths,
-            x_col=self.vbg_combo.currentText(),
-            y_col=self.vtg_combo.currentText(),
             average_mode=mode,
             expected_wavelength=self.state.data["wavelength"],
         )
@@ -2666,8 +2927,20 @@ class MainWindow(QMainWindow):
                 f"Background loaded: {n_channels} channels, {n_spectra} spectra averaged.",
                 "success",
             )
+            self._append_log(
+                "Reflection contrast is computed for every frame as RC = "
+                "(CSV spectrum - background) / background.",
+                "info",
+            )
+            self.reflection_preview_status_label.setText(
+                "Background ready. Preview one RC frame, then drag across its "
+                "spectrum to set the peak-to-peak and peak-position energy window."
+            )
             # Invalidate any previously computed maps since background changed
             self._invalidate_from_stage(2, "Background updated – RC maps need refresh.")
+            self.bg_section.set_expanded(False)
+            self.analysis_section.set_expanded(True)
+            self.sidebar_scroll.ensureWidgetVisible(self.analysis_section, 0, 16)
         except Exception:
             self._append_log(traceback.format_exc(), "error")
 
@@ -2677,8 +2950,29 @@ class MainWindow(QMainWindow):
         self.state.mode = mode
         is_rc = mode == "Reflection"
 
+        self.map_type_combo.setItemText(0, "RC Peak-to-Peak" if is_rc else "Intensity")
+        self.map_type_combo.setItemText(1, "RC Peak Position" if is_rc else "Peak Energy")
+
         # Show/hide background section
         self.bg_section.setVisible(is_rc)
+        if is_rc:
+            self.bg_section.toggle.setText("2  Background")
+            self.bg_section.set_expanded(True)
+            self.analysis_section.toggle.setText("3  Analysis Settings")
+            self.linecuts_section.toggle.setText("4  Line Cuts")
+            self.export_section.toggle.setText("5  Export")
+            self.workflow_hint_label.setText(
+                "1. Load data  →  2. Load background  →  3. Preview one RC frame "
+                "and select energy  →  4. Refresh a map"
+            )
+            self.sidebar_scroll.ensureWidgetVisible(self.bg_section, 0, 16)
+        else:
+            self.analysis_section.toggle.setText("2  Analysis Settings")
+            self.linecuts_section.toggle.setText("3  Line Cuts")
+            self.export_section.toggle.setText("4  Export")
+            self.workflow_hint_label.setText(
+                "1. Load data  →  2. Choose analysis settings  →  3. Refresh a map"
+            )
 
         # Show/hide baseline
         self.baseline_form_label.setVisible(not is_rc)
@@ -2690,6 +2984,12 @@ class MainWindow(QMainWindow):
 
         # Set sensible default colormap
         self.map_cmap_combo.setCurrentText("RdBu_r" if is_rc else "jet")
+
+        if is_rc:
+            self.reflection_preview_status_label.setText(
+                "Load CSV + background, choose X/Y, then preview one RC frame. "
+                "Drag across the spectrum to set the shared energy window."
+            )
 
         if not is_rc and self.state.data is not None and self.auto_baseline_check.isChecked():
             self._estimate_and_apply_baseline(log=True, mark_dirty=False)
@@ -2710,6 +3010,9 @@ class MainWindow(QMainWindow):
             has_background = self.state.background_spectra is not None
             has_original_map = self.state.original_map is not None
             has_transformed_map = self.state.transformed_map is not None and not self._dirty_views.get("intensity_transformed", True)
+            supports_de = bool(
+                has_data and self.state.data.get("axis_space") in {"gate", "transformed"}
+            )
             batch_linecuts_ready = self._batch_linecuts_ready()
 
             self.load_csv_btn.setEnabled(bool(csv_is_file))
@@ -2717,7 +3020,8 @@ class MainWindow(QMainWindow):
             self.preview_rc_btn.setEnabled(bool(has_data and is_rc and has_background))
             self.refresh_current_btn.setEnabled(bool(has_data and (not is_rc or has_background)))
             self.refresh_all_maps_btn.setEnabled(bool(has_data and (not is_rc or has_background)))
-            self.plot_lines_btn.setEnabled(bool(has_data))
+            self.plot_lines_btn.setEnabled(supports_de)
+            self.batch_preview_btn.setEnabled(supports_de)
             self.extract_all_doping_btn.setEnabled(bool(batch_linecuts_ready))
             self.extract_all_efield_btn.setEnabled(bool(batch_linecuts_ready))
             self.extract_all_both_btn.setEnabled(bool(batch_linecuts_ready))
@@ -2747,7 +3051,7 @@ class MainWindow(QMainWindow):
                 x_label=self.state.original_map["x_name"],
                 y_label=self.state.original_map["y_name"],
                 z_label="PL Intensity (a.u.)",
-                title=f"PL Intensity | {self.state.data.get('source_name', '')}",
+                title=self._compact_map_title("PL Intensity"),
                 cmap=cmap,
             )
             self.state.figures["original_map"] = fig
@@ -2761,11 +3065,9 @@ class MainWindow(QMainWindow):
             if self.state.data.get("axis_space") == "transformed":
                 x_label = self.state.data.get("x_name", "doping")
                 y_label = self.state.data.get("y_name", "efield")
-                title = "PL Intensity | Loaded transformed axes"
             else:
                 x_label, y_label = self._axis_labels()
-                ratio = result.get("ratio", self.ratio_spin.value())
-                title = f"PL Intensity | Transformed (ratio={ratio:.4g})"
+            title = self._compact_map_title("PL Intensity")
             self.state.transformed_map = result
             self.state.transformed_map["x_name"] = x_label
             self.state.transformed_map["y_name"] = y_label
@@ -2792,10 +3094,8 @@ class MainWindow(QMainWindow):
                 if self.state.data.get("axis_space") == "transformed":
                     x_label = self.state.data.get("x_name", "doping")
                     y_label = self.state.data.get("y_name", "efield")
-                    title = "Peak Energy Map (loaded transformed axes)"
                 else:
                     x_label, y_label = self._axis_labels()
-                    title = f"Peak Energy Map ({axes} axes)"
                 self.state.peak_map_transformed = result
                 self.state.peak_map_transformed["x_name"] = x_label
                 self.state.peak_map_transformed["y_name"] = y_label
@@ -2809,7 +3109,7 @@ class MainWindow(QMainWindow):
                 self.state.peak_map_original["z_name"] = "Peak Energy"
                 self._dirty_views["peak_original"] = False
                 figure_key = "peak_map_original"
-                title = f"Peak Energy Map ({axes} axes)"
+            title = self._compact_map_title("Peak Energy")
             cmap = self.map_cmap_combo.currentText()
             fig, _ = plot_map(
                 result["X2D"], result["Y2D"], result["Z2D"],
@@ -2890,24 +3190,30 @@ class MainWindow(QMainWindow):
         if map_payload is None or figure is None:
             self._append_log(f"No {kind} map available to save.", "warn")
             return
-        base = self._ensure_output_dir()
-        source = self.state.data["source_name"]
-        z_name = map_payload.get("z_name", kind)
-        e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
-        e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
-        e_tag = f"_{e_lo:.3f}to{e_hi:.3f}eV"
-        path = os.path.join(base, f"{source}_{z_name}{e_tag}_{kind}.{output_type}")
-        if output_type == "png":
-            figure.savefig(path, dpi=300, bbox_inches="tight", transparent=True)
-        else:
-            save_map_csv(
-                map_payload["X2D"], map_payload["Y2D"], map_payload["Z2D"],
-                path,
-                x_name=map_payload.get("x_name", "x"),
-                y_name=map_payload.get("y_name", "y"),
-                z_name=z_name,
-            )
-        self._append_log(f"Saved: {os.path.basename(path)}", "success")
+        path = ""
+        try:
+            base = self._ensure_output_dir()
+            source = self.state.data["source_name"]
+            z_name = map_payload.get("z_name", kind)
+            e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
+            e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
+            e_tag = f"_{e_lo:.3f}to{e_hi:.3f}eV"
+            path = os.path.join(base, f"{source}_{z_name}{e_tag}_{kind}.{output_type}")
+            if output_type == "png":
+                save_figure(figure, path, dpi=300)
+            else:
+                save_map_csv(
+                    map_payload["X2D"], map_payload["Y2D"], map_payload["Z2D"],
+                    path,
+                    x_name=map_payload.get("x_name", "x"),
+                    y_name=map_payload.get("y_name", "y"),
+                    z_name=z_name,
+                )
+        except Exception as exc:
+            target = path or self.out_edit.text().strip() or "the selected output directory"
+            self._append_log(f"Save failed for {target}: {exc}", "error")
+            return
+        self._append_log(f"Saved {output_type.upper()}: {path}", "success")
 
     def _save_peak_png(self) -> None:
         axes = "original"
@@ -2924,8 +3230,8 @@ class MainWindow(QMainWindow):
         base = self._ensure_output_dir()
         source = self.state.data["source_name"]
         path = os.path.join(base, f"{source}_peak_{axes}.png")
-        figure.savefig(path, dpi=300, bbox_inches="tight", transparent=True)
-        self._append_log(f"Saved: {os.path.basename(path)}", "success")
+        save_figure(figure, path, dpi=300)
+        self._append_log(f"Saved PNG: {path}", "success")
 
     def _save_peak_csv(self) -> None:
         for axes, attr, fig_key in [
@@ -2945,7 +3251,7 @@ class MainWindow(QMainWindow):
                 y_name=map_data.get("y_name", "y"),
                 z_name=map_data.get("z_name", "Peak Energy"),
             )
-            self._append_log(f"Saved: {os.path.basename(path)}", "success")
+            self._append_log(f"Saved CSV: {path}", "success")
 
     def _save_lines_png(self) -> None:
         figure = self.state.figures.get("line_cuts")
@@ -2955,8 +3261,8 @@ class MainWindow(QMainWindow):
         base = self._ensure_output_dir()
         source = self.state.data["source_name"]
         path = os.path.join(base, f"{source}_linecuts.png")
-        figure.savefig(path, dpi=300, bbox_inches="tight", transparent=True)
-        self._append_log(f"Saved: {os.path.basename(path)}", "success")
+        save_figure(figure, path, dpi=300)
+        self._append_log(f"Saved PNG: {path}", "success")
 
     def _save_lines_csvs(self) -> None:
         if not self.state.line_cut_results:

@@ -19,12 +19,13 @@ Sections
 9.  Export       – save_map_csv, save_line_csv, save_figure
 """
 
+import io
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.tri as mtri
 from matplotlib.figure import Figure
+from PIL import Image
 from scipy import optimize
 from scipy.signal import find_peaks, savgol_filter, medfilt2d
 
@@ -89,6 +90,16 @@ def _split_numeric_spectral_columns(columns, excluded=None):
     return metadata_cols, spectral_cols
 
 
+def spectral_axes_match(left, right, atol=1e-3):
+    """Return whether two wavelength axes represent the same detector channels."""
+    left_array = np.asarray(left, dtype=float).reshape(-1)
+    right_array = np.asarray(right, dtype=float).reshape(-1)
+    return bool(
+        left_array.shape == right_array.shape
+        and np.allclose(left_array, right_array, rtol=0.0, atol=float(atol))
+    )
+
+
 def normalize_axis_name(name):
     """Normalize a column name for axis-role matching."""
     return ''.join(ch for ch in str(name).lower() if ch.isalnum())
@@ -98,14 +109,16 @@ def classify_axis_role(name):
     """
     Classify a column name as a likely sweep-axis role.
 
-    Returns one of: 'tg', 'bg', 'doping', 'efield', or 'unknown'.
+    Returns one of: 'tg', 'bg', 'doping', 'efield', 'vbias', or 'unknown'.
     """
     text = normalize_axis_name(name)
     role_tokens = [
         ('doping', ('dopingset', 'doping', 'carrierdensity', 'carrier', 'density')),
         ('efield', ('efieldset', 'efield', 'electricfield', 'fieldset', 'field')),
-        ('tg', ('vtg', 'topgate', 'topg', 'axisaset', 'gatea', 'tg')),
-        ('bg', ('vbg', 'backgate', 'bottomgate', 'bottomg', 'axisbset', 'gateb', 'bg')),
+        ('vbias', ('vbiasset', 'vbias', 'biasset', 'bias')),
+        # axis_a_set / axis_b_set describe sweep order, not physical gate roles.
+        ('tg', ('vtg', 'topgate', 'topg', 'gatea', 'tg')),
+        ('bg', ('vbg', 'backgate', 'bottomgate', 'bottomg', 'gateb', 'bg')),
     ]
     matches = []
     for role, tokens in role_tokens:
@@ -117,6 +130,59 @@ def classify_axis_role(name):
         return 'unknown'
     matches.sort(reverse=True)
     return matches[0][2]
+
+
+def guess_sweep_axis_columns(columns):
+    """
+    Return the most likely (x, y) sweep columns.
+
+    Explicit acquisition markers take precedence: axis_a_set is X and
+    axis_b_set is Y. Physical-role matching is only a fallback for older files
+    that do not carry those markers.
+    """
+    candidates = list(columns)
+    if not candidates:
+        return "", ""
+
+    def first_with_token(token, exclude=""):
+        for column in candidates:
+            if column != exclude and token in normalize_axis_name(column):
+                return column
+        return ""
+
+    x_marked = first_with_token("axisaset")
+    y_marked = first_with_token("axisbset", exclude=x_marked)
+    if x_marked and y_marked:
+        marked_roles = {
+            classify_axis_role(x_marked),
+            classify_axis_role(y_marked),
+        }
+        # Preserve the application's established raw-gate orientation.
+        if marked_roles == {'bg', 'tg'}:
+            bg_column = x_marked if classify_axis_role(x_marked) == 'bg' else y_marked
+            tg_column = x_marked if classify_axis_role(x_marked) == 'tg' else y_marked
+            return bg_column, tg_column
+        return x_marked, y_marked
+
+    def first_with_role(role, exclude=""):
+        for column in candidates:
+            if column != exclude and classify_axis_role(column) == role:
+                return column
+        return ""
+
+    for x_role, y_role in (
+        ("doping", "efield"),
+        ("doping", "vbias"),
+        ("bg", "tg"),
+    ):
+        x_guess = first_with_role(x_role)
+        y_guess = first_with_role(y_role, exclude=x_guess)
+        if x_guess and y_guess:
+            return x_guess, y_guess
+
+    x_guess = candidates[0]
+    y_guess = next((column for column in candidates if column != x_guess), "")
+    return x_guess, y_guess
 
 
 def validate_axis_selection(x_name, y_name):
@@ -152,6 +218,14 @@ def validate_axis_selection(x_name, y_name):
             'y_role': y_role,
             'message': 'Transformed axes detected: X=Doping, Y=Efield.',
         }
+    if x_role == 'doping' and y_role == 'vbias':
+        return {
+            'ok': True,
+            'mode': 'doping_bias',
+            'x_role': x_role,
+            'y_role': y_role,
+            'message': 'Sweep axes detected: X=Doping, Y=Vbias.',
+        }
     if x_role == 'tg' and y_role == 'bg':
         return {
             'ok': False,
@@ -167,6 +241,24 @@ def validate_axis_selection(x_name, y_name):
             'x_role': x_role,
             'y_role': y_role,
             'message': 'Axis selections look swapped: use X=Doping and Y=Efield for transformed-axis files.',
+        }
+    if x_role == 'vbias' and y_role == 'doping':
+        return {
+            'ok': False,
+            'mode': 'swapped_doping_bias',
+            'x_role': x_role,
+            'y_role': y_role,
+            'message': 'Axis selections look swapped: use X=Doping and Y=Vbias for doping-bias sweeps.',
+        }
+    x_text = normalize_axis_name(x_name)
+    y_text = normalize_axis_name(y_name)
+    if 'axisaset' in x_text and 'axisbset' in y_text:
+        return {
+            'ok': True,
+            'mode': 'generic_sweep',
+            'x_role': x_role,
+            'y_role': y_role,
+            'message': f'Sweep axes detected: X={x_name}, Y={y_name}.',
         }
     if x_role in {'bg', 'tg'} or y_role in {'bg', 'tg'}:
         mode = 'unknown_gate'
@@ -188,15 +280,45 @@ def validate_axis_selection(x_name, y_name):
 
 def _infer_axis_space(x_name, y_name):
     """Classify whether the selected axes are raw gate axes or transformed axes."""
-    roles = {classify_axis_role(x_name), classify_axis_role(y_name)}
-    if roles & {'doping', 'efield'}:
+    x_role = classify_axis_role(x_name)
+    y_role = classify_axis_role(y_name)
+    if x_role == 'doping' and y_role == 'efield':
         return "transformed"
-    return "gate"
+    if x_role == 'bg' and y_role == 'tg':
+        return "gate"
+    return "generic"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  I/O
 # ─────────────────────────────────────────────────────────────────────────────
+
+def load_spectral_csv(csv_path):
+    """
+    Load only numeric-header spectral channels from a CSV.
+
+    This is intended for reference/background files, whose metadata columns do
+    not need to match the primary sweep-axis columns.
+    """
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    metadata_cols, spec_cols = _split_numeric_spectral_columns(df.columns)
+    if not spec_cols:
+        extra = f" Non-spectral columns seen: {metadata_cols[:5]}" if metadata_cols else ""
+        raise ValueError("No numeric wavelength columns found in background CSV." + extra)
+
+    wavelength = np.asarray(spec_cols, dtype=float)
+    intensity = df[spec_cols].to_numpy(dtype=float)
+    return {
+        "df": df,
+        "wavelength": wavelength,
+        "energy": 1240.0 / wavelength,
+        "Intensity": intensity,
+        "source_name": os.path.splitext(os.path.basename(csv_path))[0],
+    }
+
 
 def load_megasweep_csv(csv_path, x_col=None, y_col=None):
     """
@@ -285,6 +407,7 @@ def load_megasweep_csv(csv_path, x_col=None, y_col=None):
         'Intensity': Intensity,
         'raw_data': np.column_stack([x_data, y_data, Intensity]),
         'source_name': source_name,
+        'source_path': os.path.abspath(csv_path),
     }
 
 
@@ -833,6 +956,11 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
     When ``axis_space == 'transformed'``, x_data/y_data are treated as the
     already-loaded doping/efield coordinates directly.
     """
+    if axis_space not in {'gate', 'transformed'}:
+        raise ValueError(
+            "Doping/Efield line cuts require BG/TG gate axes or loaded "
+            "Doping/Efield axes; generic sweep axes are not supported."
+        )
     if axis_space == 'transformed':
         D, E = _transformed_axis_arrays(x_data, y_data, x_axis_name=x_axis_name, y_axis_name=y_axis_name)
         d_label = 'Doping (V)'
@@ -976,6 +1104,11 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
         raise ValueError("epsilon must be zero or positive.")
     if min_points < 1:
         raise ValueError("min_points must be at least 1.")
+    if axis_space not in {'gate', 'transformed'}:
+        raise ValueError(
+            "Doping/Efield line cuts require BG/TG gate axes or loaded "
+            "Doping/Efield axes; generic sweep axes are not supported."
+        )
 
     x_vals = np.asarray(x_data, dtype=float).reshape(-1)
     y_vals = np.asarray(y_data, dtype=float).reshape(-1)
@@ -1057,7 +1190,7 @@ def plot_map(X2D, Y2D, Z2D,
              vmin=None, vmax=None,
              figsize=(6, 4.8)):
     """
-    Plot a 2-D map as a filled-contour plot.
+    Plot a 2-D map without interpolating between measured samples.
 
     Returns
     -------
@@ -1075,23 +1208,49 @@ def plot_map(X2D, Y2D, Z2D,
         xf = x_arr[finite]
         yf = y_arr[finite]
         zf = z_arr[finite]
-        if xf.size < 3 or len(np.unique(xf)) < 2 or len(np.unique(yf)) < 2:
-            artist = ax.scatter(xf, yf, c=zf, cmap=cmap, vmin=v0, vmax=v1, s=14, linewidths=0)
-        else:
-            try:
-                triang = mtri.Triangulation(xf, yf)
-                if is_flat:
-                    artist = ax.tripcolor(triang, zf, cmap=cmap, shading='flat', vmin=v0, vmax=v1)
-                else:
-                    levels = np.linspace(v0, v1, n_levels)
-                    artist = ax.tricontourf(triang, zf, levels=levels, cmap=cmap, vmin=v0, vmax=v1)
-            except Exception:
-                artist = ax.scatter(xf, yf, c=zf, cmap=cmap, vmin=v0, vmax=v1, s=14, linewidths=0)
-    elif _is_rectilinear_grid(x_arr, y_arr) and not is_flat:
-        levels = np.linspace(v0, v1, n_levels)
-        artist = ax.contourf(x_arr, y_arr, z_arr, levels=levels, cmap=cmap, vmin=v0, vmax=v1)
+        point_size = max(5.0, min(28.0, 16000.0 / max(1, xf.size)))
+        artist = ax.scatter(
+            xf,
+            yf,
+            c=zf,
+            cmap=cmap,
+            vmin=v0,
+            vmax=v1,
+            marker='s',
+            s=point_size,
+            linewidths=0,
+            rasterized=True,
+        )
+    elif _is_rectilinear_grid(x_arr, y_arr):
+        # X/Y contain the measured cell centres. "nearest" derives cell edges
+        # from those centres and assigns exactly one solid colour per Z sample.
+        artist = ax.pcolormesh(
+            x_arr,
+            y_arr,
+            z_arr,
+            cmap=cmap,
+            shading='nearest',
+            vmin=v0,
+            vmax=v1,
+            linewidth=0,
+            edgecolors='none',
+            antialiased=False,
+            rasterized=True,
+        )
     else:
-        artist = ax.pcolormesh(x_arr, y_arr, z_arr, cmap=cmap, shading='auto', vmin=v0, vmax=v1)
+        artist = ax.pcolormesh(
+            x_arr,
+            y_arr,
+            z_arr,
+            cmap=cmap,
+            shading='nearest',
+            vmin=v0,
+            vmax=v1,
+            linewidth=0,
+            edgecolors='none',
+            antialiased=False,
+            rasterized=True,
+        )
 
     fig.colorbar(artist, ax=ax, label=z_label)
     ax.set_xlabel(x_label)
@@ -1185,5 +1344,28 @@ def save_line_csv(line_cut: dict, path: str) -> None:
 
 
 def save_figure(fig, path: str, dpi: int = 300) -> None:
-    """Save a matplotlib Figure to *path* (PNG, PDF, SVG, …)."""
-    fig.savefig(path, dpi=dpi, bbox_inches='tight', transparent=True)
+    """Save a figure, normalizing PNG output for Microsoft Office."""
+    if os.path.splitext(path)[1].lower() == ".png":
+        # PowerPoint is most reliable with a plain, opaque 8-bit RGB PNG.
+        buffer = io.BytesIO()
+        fig.savefig(
+            buffer,
+            format="png",
+            dpi=dpi,
+            bbox_inches="tight",
+            facecolor="white",
+            transparent=False,
+        )
+        buffer.seek(0)
+        with Image.open(buffer) as rendered:
+            rgb_image = rendered.convert("RGB")
+            rgb_image.save(
+                path,
+                format="PNG",
+                dpi=(dpi, dpi),
+                optimize=False,
+                compress_level=6,
+            )
+        return
+
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")

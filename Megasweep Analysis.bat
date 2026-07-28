@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-rem Megasweep PL Analysis - Windows launcher
+rem Megasweep Analysis - Windows launcher
 rem Creates/updates the local .venv when needed, then runs the GUI app.
 
 cd /d "%~dp0"
@@ -10,7 +10,10 @@ set "VENV_DIR=%~dp0.venv"
 set "REQ_FILE=%~dp0requirements.txt"
 set "ACTIVATE_BAT=%VENV_DIR%\Scripts\activate.bat"
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
+set "VENV_PYTHONW=%VENV_DIR%\Scripts\pythonw.exe"
 set "APP_ENTRY=%~dp0main.py"
+set "SHORTCUT_SCRIPT=%~dp0Create_Megasweep_Shortcut.ps1"
+set "APP_SHORTCUT=%~dp0Megasweep Analysis.lnk"
 
 if not exist "%APP_ENTRY%" (
     echo.
@@ -98,11 +101,26 @@ if errorlevel 1 (
     goto error_exit
 )
 
+if not exist "%VENV_PYTHONW%" (
+    echo.
+    echo [ERROR] GUI Python launcher not found:
+    echo         %VENV_PYTHONW%
+    goto error_exit
+)
+
+if exist "%SHORTCUT_SCRIPT%" if not exist "%APP_SHORTCUT%" (
+    echo [SETUP] Creating Megasweep Analysis shortcut ...
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SHORTCUT_SCRIPT%" -AppRoot "%~dp0"
+    if errorlevel 1 (
+        echo [WARNING] Shortcut creation failed. The application can still run.
+    )
+)
+
 echo [RUN] Starting Megasweep PL Analysis ...
-python "%APP_ENTRY%"
+start "" "%VENV_PYTHONW%" "%APP_ENTRY%"
 if errorlevel 1 (
     echo.
-    echo [ERROR] App exited with code %ERRORLEVEL%.
+    echo [ERROR] Failed to start the application.
     goto error_exit
 )
 
