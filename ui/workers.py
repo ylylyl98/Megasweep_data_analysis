@@ -11,6 +11,7 @@ from megasweep_analysis import (
     compute_intensity_map,
     compute_peak_energy_map,
     compute_peak_energy,
+    compute_rc_at_energy_map,
     compute_rc_spectra,
     compute_rc_peak_position_map,
     compute_rc_peak_to_peak_map,
@@ -26,7 +27,11 @@ from megasweep_analysis import (
 )
 
 
-def _compute_reflection_spectra(data: dict, background_spectra) -> np.ndarray:
+def _compute_reflection_spectra(
+    data: dict,
+    background_spectra,
+    background_scale: float = 1.0,
+) -> np.ndarray:
     if background_spectra is None:
         raise ValueError("Reflection mode requires a loaded background spectrum before RC can be computed.")
 
@@ -39,7 +44,54 @@ def _compute_reflection_spectra(data: dict, background_spectra) -> np.ndarray:
             f"Data has {n_channels} channels, background has {background.shape[0]}. "
             "Reload a matching background CSV for this dataset."
         )
-    return compute_rc_spectra(intensity, background)
+    return compute_rc_spectra(
+        intensity,
+        background,
+        background_scale=background_scale,
+    )
+
+
+def _build_transformed_map_payload(
+    data: dict,
+    quantity_flat,
+    ratio: float,
+    tg_is_y: bool,
+    convention: str,
+) -> dict:
+    """Preserve the original sweep-cell topology in transformed coordinates."""
+    payload = build_map_payload(
+        data["x_data"],
+        data["y_data"],
+        quantity_flat,
+    )
+    axis1_flat, axis2_flat = compute_transformed_coords(
+        data["x_data"],
+        data["y_data"],
+        ratio,
+        tg_is_y=tg_is_y,
+        convention=convention,
+    )
+    payload["x_flat"] = np.asarray(axis1_flat, dtype=float)[
+        payload["idx_flat"]
+    ]
+    payload["y_flat"] = np.asarray(axis2_flat, dtype=float)[
+        payload["idx_flat"]
+    ]
+
+    if np.asarray(payload["X2D"]).ndim == 2:
+        axis1_grid, axis2_grid = compute_transformed_coords(
+            payload["X2D"],
+            payload["Y2D"],
+            ratio,
+            tg_is_y=tg_is_y,
+            convention=convention,
+        )
+        payload["X2D"] = axis1_grid
+        payload["Y2D"] = axis2_grid
+    else:
+        payload["X2D"] = payload["x_flat"]
+        payload["Y2D"] = payload["y_flat"]
+    return payload
 
 
 class BaseWorker(QObject):
@@ -175,6 +227,9 @@ class AnalysisRefreshWorker(BaseWorker):
         mode: str = "PL",
         background_spectra=None,
         convention: str = "TG+rBG",
+        fixed_energy: float | None = None,
+        background_scale: float = 1.0,
+        rc_feature_mode: str = "auto",
     ):
         super().__init__()
         self.data = data
@@ -189,6 +244,9 @@ class AnalysisRefreshWorker(BaseWorker):
         self.mode = mode
         self.background_spectra = background_spectra
         self.convention = convention
+        self.fixed_energy = fixed_energy
+        self.background_scale = background_scale
+        self.rc_feature_mode = rc_feature_mode
 
     def process(self) -> dict:
         tasks = set(self.tasks)
@@ -199,10 +257,170 @@ class AnalysisRefreshWorker(BaseWorker):
 
         self.log.emit("Refreshing map analysis...")
 
+        ibias_tasks = {"ibias_original", "ibias_transformed"} & tasks
+        if ibias_tasks:
+            ibias_values = self.data.get("ibias_data")
+            ibias_name = self.data.get("ibias_name")
+            if ibias_values is None or not ibias_name:
+                raise ValueError(
+                    "No measured Ibias column was found. Expected a column such "
+                    "as 'Ibias_A', 'Ibias_meas', or 'Ibias'."
+                )
+            ibias_values = np.asarray(ibias_values, dtype=float).reshape(-1)
+            if ibias_values.size != np.asarray(self.data["x_data"]).size:
+                raise ValueError(
+                    "The measured Ibias column does not match the number of sweep rows."
+                )
+            if not np.any(np.isfinite(ibias_values)):
+                raise ValueError("The measured Ibias column contains no finite values.")
+
+            self.log.emit(f"Building Ibias map from column '{ibias_name}'...")
+            if "ibias_original" in tasks:
+                ibias_original = build_map_payload(
+                    self.data["x_data"],
+                    self.data["y_data"],
+                    ibias_values,
+                )
+                ibias_original["target_axes"] = "original"
+                ibias_original["source_column"] = ibias_name
+                payload["ibias_map_original"] = ibias_original
+
+            if "ibias_transformed" in tasks:
+                axis_space = self.data.get("axis_space", "gate")
+                if axis_space == "transformed":
+                    ibias_transformed = build_map_payload(
+                        self.data["x_data"],
+                        self.data["y_data"],
+                        ibias_values,
+                    )
+                elif axis_space == "gate":
+                    ibias_transformed = _build_transformed_map_payload(
+                        self.data,
+                        ibias_values,
+                        self.ratio,
+                        self.tg_is_y,
+                        self.convention,
+                    )
+                else:
+                    raise ValueError(
+                        "D/E transformed views require BG/TG gate axes or loaded "
+                        "Doping/Efield axes. Use the Original view for this sweep."
+                    )
+                ibias_transformed["target_axes"] = "transformed"
+                ibias_transformed["source_column"] = ibias_name
+                ibias_transformed["ratio"] = self.ratio
+                ibias_transformed["convention"] = self.convention
+                payload["ibias_map_transformed"] = ibias_transformed
+
+        resistance_tasks = {"resistance_original", "resistance_transformed"} & tasks
+        if resistance_tasks:
+            ibias_values = self.data.get("ibias_data")
+            vbias_values = self.data.get("vbias_data")
+            ibias_name = self.data.get("ibias_name")
+            vbias_name = self.data.get("vbias_name")
+            if ibias_values is None or not ibias_name:
+                raise ValueError(
+                    "Resistance requires a measured Ibias column such as "
+                    "'Ibias_A', 'Ibias_meas', or 'Ibias'."
+                )
+            if vbias_values is None or not vbias_name:
+                raise ValueError(
+                    "Resistance requires Vbias. Expected a measured column such "
+                    "as 'Vbias_meas', or a selected Vbias sweep axis."
+                )
+
+            ibias_values = np.asarray(ibias_values, dtype=float).reshape(-1)
+            vbias_values = np.asarray(vbias_values, dtype=float).reshape(-1)
+            row_count = np.asarray(self.data["x_data"]).size
+            if ibias_values.size != row_count or vbias_values.size != row_count:
+                raise ValueError(
+                    "The Vbias/Ibias columns do not match the number of sweep rows."
+                )
+
+            valid = (
+                np.isfinite(vbias_values)
+                & np.isfinite(ibias_values)
+                & (ibias_values != 0.0)
+            )
+            resistance_values = np.full(row_count, np.nan, dtype=float)
+            np.divide(
+                vbias_values,
+                ibias_values,
+                out=resistance_values,
+                where=valid,
+            )
+            finite_resistance = np.isfinite(resistance_values)
+            if not np.any(finite_resistance):
+                raise ValueError(
+                    "Resistance could not be calculated: all Vbias/Ibias rows "
+                    "are invalid or have zero current."
+                )
+            invalid_count = int(row_count - np.count_nonzero(finite_resistance))
+            self.log.emit(
+                f"Building resistance map as {vbias_name} / {ibias_name}"
+                + (
+                    f"; {invalid_count} zero-current or invalid row(s) are blank."
+                    if invalid_count
+                    else "."
+                )
+            )
+
+            if "resistance_original" in tasks:
+                resistance_original = build_map_payload(
+                    self.data["x_data"],
+                    self.data["y_data"],
+                    resistance_values,
+                )
+                resistance_original["target_axes"] = "original"
+                resistance_original["vbias_column"] = vbias_name
+                resistance_original["ibias_column"] = ibias_name
+                payload["resistance_map_original"] = resistance_original
+
+            if "resistance_transformed" in tasks:
+                axis_space = self.data.get("axis_space", "gate")
+                if axis_space == "transformed":
+                    resistance_transformed = build_map_payload(
+                        self.data["x_data"],
+                        self.data["y_data"],
+                        resistance_values,
+                    )
+                elif axis_space == "gate":
+                    resistance_transformed = _build_transformed_map_payload(
+                        self.data,
+                        resistance_values,
+                        self.ratio,
+                        self.tg_is_y,
+                        self.convention,
+                    )
+                else:
+                    raise ValueError(
+                        "D/E transformed views require BG/TG gate axes or loaded "
+                        "Doping/Efield axes. Use the Original view for this sweep."
+                    )
+                resistance_transformed["target_axes"] = "transformed"
+                resistance_transformed["vbias_column"] = vbias_name
+                resistance_transformed["ibias_column"] = ibias_name
+                resistance_transformed["ratio"] = self.ratio
+                resistance_transformed["convention"] = self.convention
+                payload["resistance_map_transformed"] = resistance_transformed
+
+        spectral_tasks = tasks - {
+            "ibias_original",
+            "ibias_transformed",
+            "resistance_original",
+            "resistance_transformed",
+        }
+        if not spectral_tasks:
+            return payload
+
         # Determine effective intensity matrix and map values based on mode
         if self.mode == "Reflection":
             self.log.emit("Computing RC spectra from the loaded background...")
-            rc = _compute_reflection_spectra(self.data, self.background_spectra)
+            rc = _compute_reflection_spectra(
+                self.data,
+                self.background_spectra,
+                self.background_scale,
+            )
             intensity_flat = compute_rc_peak_to_peak_map(rc, self.data['energy'], self.min_energy, self.max_energy)
             working_intensity = rc  # for peak energy computation
         else:
@@ -219,10 +437,11 @@ class AnalysisRefreshWorker(BaseWorker):
             self.data["y_data"],
             intensity_flat,
         )
-        payload["original_map"] = original_map
+        if {"intensity_original", "intensity_transformed", "peak_original", "peak_transformed"} & tasks:
+            payload["original_map"] = original_map
 
         transformed_map = None
-        if {"intensity_transformed", "peak_transformed"} & tasks:
+        if {"intensity_transformed", "peak_transformed", "fixed_transformed"} & tasks:
             axis_space = self.data.get("axis_space", "gate")
             if axis_space == "transformed":
                 self.log.emit("Loaded axes are already transformed; reusing them for transformed view...")
@@ -230,14 +449,13 @@ class AnalysisRefreshWorker(BaseWorker):
                 transformed_map["already_transformed"] = True
             elif axis_space == "gate":
                 self.log.emit("Computing transformed coordinate view...")
-                axis1, axis2 = compute_transformed_coords(
-                    self.data["x_data"],
-                    self.data["y_data"],
+                transformed_map = _build_transformed_map_payload(
+                    self.data,
+                    intensity_flat,
                     self.ratio,
-                    tg_is_y=self.tg_is_y,
-                    convention=self.convention,
+                    self.tg_is_y,
+                    self.convention,
                 )
-                transformed_map = build_map_payload(axis1, axis2, intensity_flat)
             else:
                 raise ValueError(
                     "D/E transformed views require BG/TG gate axes or loaded "
@@ -245,7 +463,51 @@ class AnalysisRefreshWorker(BaseWorker):
                 )
             transformed_map["ratio"] = self.ratio
             transformed_map["convention"] = self.convention
-            payload["transformed_map"] = transformed_map
+            if "intensity_transformed" in tasks:
+                payload["transformed_map"] = transformed_map
+
+        if {"fixed_original", "fixed_transformed"} & tasks:
+            if self.mode != "Reflection":
+                raise ValueError("Fixed-energy RC maps are available only in Reflection mode.")
+            if self.fixed_energy is None:
+                raise ValueError("Choose a fixed energy before generating an RC-at-energy map.")
+            self.log.emit(f"Interpolating RC at {self.fixed_energy:.6f} eV...")
+            fixed_flat = compute_rc_at_energy_map(
+                working_intensity,
+                self.data["energy"],
+                self.fixed_energy,
+            )
+            if "fixed_original" in tasks:
+                fixed_original = build_map_payload(
+                    self.data["x_data"],
+                    self.data["y_data"],
+                    fixed_flat,
+                )
+                fixed_original["target_axes"] = "original"
+                fixed_original["fixed_energy"] = self.fixed_energy
+                payload["fixed_map_original"] = fixed_original
+            if "fixed_transformed" in tasks:
+                if transformed_map is None:
+                    raise ValueError("Transformed coordinates were not available for the fixed-energy map.")
+                if self.data.get("axis_space", "gate") == "transformed":
+                    fixed_transformed = build_map_payload(
+                        self.data["x_data"],
+                        self.data["y_data"],
+                        fixed_flat,
+                    )
+                else:
+                    fixed_transformed = _build_transformed_map_payload(
+                        self.data,
+                        fixed_flat,
+                        self.ratio,
+                        self.tg_is_y,
+                        self.convention,
+                    )
+                fixed_transformed["target_axes"] = "transformed"
+                fixed_transformed["fixed_energy"] = self.fixed_energy
+                fixed_transformed["ratio"] = self.ratio
+                fixed_transformed["convention"] = self.convention
+                payload["fixed_map_transformed"] = fixed_transformed
 
         if {"peak_original", "peak_transformed"} & tasks:
             if self.mode == "Reflection":
@@ -257,6 +519,7 @@ class AnalysisRefreshWorker(BaseWorker):
                     self.max_energy,
                     self.sg_window,
                     self.sg_poly,
+                    feature_mode=self.rc_feature_mode,
                 )
             else:
                 self.log.emit("Computing peak-energy map...")
@@ -280,19 +543,22 @@ class AnalysisRefreshWorker(BaseWorker):
                         peak_flat,
                     )
                 else:
-                    axis1, axis2 = compute_transformed_coords(
-                        self.data["x_data"],
-                        self.data["y_data"],
+                    peak_transformed = _build_transformed_map_payload(
+                        self.data,
+                        peak_flat,
                         self.ratio,
-                        tg_is_y=self.tg_is_y,
-                        convention=self.convention,
+                        self.tg_is_y,
+                        self.convention,
                     )
-                    peak_transformed = build_map_payload(axis1, axis2, peak_flat)
                 peak_transformed["target_axes"] = "transformed"
                 peak_transformed["ratio"] = self.ratio
                 peak_transformed["convention"] = self.convention
                 payload["peak_map_transformed"] = peak_transformed
 
+        if self.mode == "Reflection":
+            for map_data in payload.values():
+                if isinstance(map_data, dict) and "Z2D" in map_data:
+                    map_data["background_scale"] = float(self.background_scale)
         return payload
 
 
@@ -391,6 +657,7 @@ class LineWorker(BaseWorker):
         tg_is_y: bool = True,
         background_spectra=None,
         convention: str = "TG+rBG",
+        background_scale: float = 1.0,
     ):
         super().__init__()
         self.data = data
@@ -399,11 +666,16 @@ class LineWorker(BaseWorker):
         self.tg_is_y = tg_is_y
         self.background_spectra = background_spectra
         self.convention = convention
+        self.background_scale = background_scale
 
     def process(self) -> dict:
         if self.background_spectra is not None:
             self.log.emit("Computing RC spectra for line cuts...")
-            working_intensity = _compute_reflection_spectra(self.data, self.background_spectra)
+            working_intensity = _compute_reflection_spectra(
+                self.data,
+                self.background_spectra,
+                self.background_scale,
+            )
         else:
             working_intensity = self.data["Intensity"]
 
@@ -452,29 +724,33 @@ class BatchLineWorker(BaseWorker):
         cut_types: list[str],
         epsilon: float,
         output_dir: str,
-        source_name: str,
         ratio: float,
         tg_is_y: bool = True,
         background_spectra=None,
         convention: str = "TG+rBG",
+        background_scale: float = 1.0,
     ):
         super().__init__()
         self.data = data
         self.cut_types = cut_types
         self.epsilon = epsilon
         self.output_dir = output_dir
-        self.source_name = source_name
         self.ratio = ratio
         self.tg_is_y = tg_is_y
         self.background_spectra = background_spectra
         self.convention = convention
+        self.background_scale = background_scale
 
     def process(self) -> dict:
         os.makedirs(self.output_dir, exist_ok=True)
 
         if self.background_spectra is not None:
             self.log.emit("Computing RC spectra for batch line cuts...")
-            working_intensity = _compute_reflection_spectra(self.data, self.background_spectra)
+            working_intensity = _compute_reflection_spectra(
+                self.data,
+                self.background_spectra,
+                self.background_scale,
+            )
             is_rc = True
         else:
             working_intensity = self.data["Intensity"]
@@ -570,7 +846,7 @@ class BatchLineWorker(BaseWorker):
 
             # Use 'n'/'p' prefix instead of '+'/'-' — '+' is invalid in Windows filenames
             sign = "n" if c_value < 0 else "p"
-            stem = f"{self.source_name}_{cut_type}_{sign}{abs(c_value):.4f}"
+            stem = f"{cut_type}_{sign}{abs(c_value):.4f}"
             csv_path = os.path.join(subfolder, f"{stem}.csv")
             save_line_csv(line_cut, csv_path)
             saved_files.append(csv_path)

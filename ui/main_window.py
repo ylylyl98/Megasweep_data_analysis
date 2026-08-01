@@ -41,16 +41,20 @@ from PySide6.QtWidgets import (
 )
 
 from megasweep_analysis import (
+    compute_rc_at_energy_map,
     compute_rc_spectra,
+    estimate_background_scale,
     estimate_global_baseline,
     extract_line_cut,
     find_all_cut_values,
     guess_sweep_axis_columns,
     plot_line_cut_spectrogram,
     plot_map,
+    resolve_dataset_output_dir,
     save_line_csv,
     save_map_csv,
     save_figure,
+    save_figure_with_axes_size,
     spectral_axes_match,
     validate_axis_selection,
 )
@@ -544,6 +548,7 @@ class CsvDropLineEdit(QLineEdit):
 
 
 class MainWindow(QMainWindow):
+    _EXPORT_MAP_AXES_SIZE = (3.0, 3.0)
     _LOG_COLORS = {
         "info": "#334155",
         "success": "#15803d",
@@ -565,6 +570,8 @@ class MainWindow(QMainWindow):
         self._intensity_range_user_modified = False
         self._intensity_defaults_csv_signature: tuple[str, float, float, int] | None = None
         self._suppress_intensity_tracking = False
+        self._fixed_energy_user_modified = False
+        self._suppress_fixed_energy_tracking = False
         self._baseline_user_modified = False
         self._suppress_baseline_tracking = False
         self._background_paths: list[str] = []
@@ -575,6 +582,12 @@ class MainWindow(QMainWindow):
             "intensity_transformed": True,
             "peak_original": True,
             "peak_transformed": True,
+            "fixed_original": True,
+            "fixed_transformed": True,
+            "ibias_original": True,
+            "ibias_transformed": True,
+            "resistance_original": True,
+            "resistance_transformed": True,
             "line_cuts": True,
         }
 
@@ -639,6 +652,19 @@ class MainWindow(QMainWindow):
             f"{stage_name} payload: X{np.shape(payload['X2D'])}, Y{np.shape(payload['Y2D'])}, "
             f"Z{np.shape(payload['Z2D'])}"
         )
+        missing_count = int(payload.get("missing_count", 0))
+        if missing_count:
+            measured_count = int(payload.get("measured_count", 0))
+            expected_count = int(payload.get("expected_count", 0))
+            missing_percent = (
+                100.0 * missing_count / expected_count
+                if expected_count
+                else 0.0
+            )
+            summary += (
+                f", measured {measured_count}/{expected_count}, "
+                f"missing {missing_count} ({missing_percent:.2f}%)"
+            )
         if ratio is not None:
             summary += f", ratio={ratio:.4f}"
         self._append_log(summary, "info")
@@ -742,7 +768,9 @@ class MainWindow(QMainWindow):
         map_row.setSpacing(8)
         map_row.addWidget(QLabel("Map Type"))
         self.map_type_combo = QComboBox()
-        self.map_type_combo.addItems(["Intensity", "Peak Energy"])
+        self.map_type_combo.addItems(
+            ["Intensity", "Peak Energy", "Ibias", "Resistance"]
+        )
         self.map_type_combo.setFixedWidth(145)
         self.map_type_combo.currentTextChanged.connect(self._on_map_selection_changed)
         map_row.addWidget(self.map_type_combo)
@@ -823,8 +851,20 @@ class MainWindow(QMainWindow):
         self.line_plot_tab = PlotTab("Line Cuts")
         line_layout.addWidget(self.line_plot_tab, 1)
 
+        self.raw_background_workspace = QWidget()
+        raw_background_layout = QVBoxLayout(self.raw_background_workspace)
+        raw_background_layout.setContentsMargins(8, 8, 8, 8)
+        raw_background_layout.setSpacing(0)
+        self.raw_background_plot_tab = PlotTab("Raw / Background")
+        raw_background_layout.addWidget(self.raw_background_plot_tab, 1)
+
         self.workspace_tabs.addTab(self.maps_workspace, "Maps")
         self.workspace_tabs.addTab(self.line_workspace, "Line Cuts")
+        self.raw_background_tab_index = self.workspace_tabs.addTab(
+            self.raw_background_workspace,
+            "Raw / Background",
+        )
+        self.workspace_tabs.setTabVisible(self.raw_background_tab_index, False)
         preview_layout.addWidget(self.workspace_tabs, 1)
 
         log_widget = QWidget()
@@ -900,6 +940,14 @@ class MainWindow(QMainWindow):
         out_btn.setToolTip("Choose where exported maps and line cuts are saved.")
         out_btn.clicked.connect(self._browse_output)
         form.addRow("Output dir:", self._hrow(self.out_edit, out_btn))
+
+        self.active_output_label = QLabel(
+            "Select a CSV to determine its results subfolder."
+        )
+        self.active_output_label.setWordWrap(True)
+        self.active_output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.active_output_label.setStyleSheet("color:#5a7088; font-size:9px;")
+        form.addRow("Saves to:", self.active_output_label)
 
         self.vbg_combo = QComboBox()
         self.vtg_combo = QComboBox()
@@ -980,18 +1028,25 @@ class MainWindow(QMainWindow):
         self._configure_sidebar_form(form)
         self.analysis_group = group
 
-        self.int_min_spin = self._dspin(0.01, 10.0, 0.01, 3, 1.247)
-        self.int_max_spin = self._dspin(0.01, 10.0, 0.01, 3, 1.428)
+        self.int_min_spin = self._dspin(0.01, 10.0, 0.000001, 6, 1.247)
+        self.int_max_spin = self._dspin(0.01, 10.0, 0.000001, 6, 1.428)
+        self.fixed_energy_spin = self._dspin(0.01, 10.0, 0.000001, 6, 1.3375)
         self.baseline_spin = self._dspin(0.0, 1e6, 1.0, 2, 595.0)
         self.ratio_spin = self._dspin(0.001, 100.0, 0.01, 4, 1.0)
         self.int_min_spin.valueChanged.connect(self._on_energy_window_changed)
         self.int_max_spin.valueChanged.connect(self._on_energy_window_changed)
+        self.fixed_energy_spin.valueChanged.connect(self._on_fixed_energy_changed)
         energy_window_help = (
             "Shared analysis window. In Reflection mode, preview one RC frame "
-            "and drag across its spectrum to set this range. Both RC map types use it."
+            "and drag across its spectrum to set this range. RC Peak-to-Peak and "
+            "RC Peak Position use this window."
         )
         self.int_min_spin.setToolTip(energy_window_help)
         self.int_max_spin.setToolTip(energy_window_help)
+        self.fixed_energy_spin.setToolTip(
+            "Exact photon energy for the RC at Energy map. Each spectrum is "
+            "linearly interpolated at this energy."
+        )
         self.baseline_spin.valueChanged.connect(self._on_baseline_changed)
         self.ratio_spin.valueChanged.connect(self._on_ratio_changed)
         self.auto_baseline_check = QCheckBox("Auto")
@@ -1015,16 +1070,59 @@ class MainWindow(QMainWindow):
         # RC preview spinboxes (separate rows so they fit the sidebar width)
         self.reflection_preview_vbg_spin = self._dspin(-1e4, 1e4, 0.1, 3, 0.0)
         self.reflection_preview_vtg_spin = self._dspin(-1e4, 1e4, 0.1, 3, 0.0)
+        self.rc_feature_combo = QComboBox()
+        self.rc_feature_combo.addItem("Auto: peak, then dip", "auto")
+        self.rc_feature_combo.addItem("Peak: local maximum", "peak")
+        self.rc_feature_combo.addItem("Dip: local minimum", "dip")
+        self.rc_feature_combo.currentIndexChanged.connect(
+            self._on_peak_settings_changed
+        )
+        self.background_scale_check = QCheckBox(
+            "Scale background using both side windows"
+        )
+        self.background_scale_check.setChecked(True)
+        self.scale_left_min_spin = self._dspin(
+            0.01, 10.0, 0.000001, 6, 1.530000
+        )
+        self.scale_left_max_spin = self._dspin(
+            0.01, 10.0, 0.000001, 6, 1.545000
+        )
+        self.scale_right_min_spin = self._dspin(
+            0.01, 10.0, 0.000001, 6, 1.565000
+        )
+        self.scale_right_max_spin = self._dspin(
+            0.01, 10.0, 0.000001, 6, 1.580000
+        )
+        self.estimate_background_scale_btn = QPushButton(
+            "Estimate Scale from Preview Frame"
+        )
+        self.background_scale_status_label = QLabel("Scale α: not estimated")
+        self.background_scale_status_label.setWordWrap(True)
+        self.background_scale_status_label.setStyleSheet("color:#5a7088;")
+        self.background_scale_check.toggled.connect(
+            self._on_background_scale_enabled_changed
+        )
+        for spin in (
+            self.scale_left_min_spin,
+            self.scale_left_max_spin,
+            self.scale_right_min_spin,
+            self.scale_right_max_spin,
+        ):
+            spin.valueChanged.connect(self._on_background_scale_window_changed)
+        self.estimate_background_scale_btn.clicked.connect(
+            self._estimate_and_apply_background_scale
+        )
         self.preview_rc_btn = QPushButton("Preview One RC Frame")
         self.preview_rc_btn.clicked.connect(self._preview_reflection_spectra)
         self.preview_rc_btn.setToolTip(
             "Plot the RC spectrum for the nearest X/Y frame. Drag horizontally "
-            "on the plot to set the shared energy window."
+            "on the plot to set the peak window; the purple marker shows Fixed E."
         )
 
         self.reflection_preview_status_label = QLabel(
             "Load CSV + background, choose X/Y, then preview one RC frame. "
-            "Drag across the spectrum to set the map energy window."
+            "Drag across the spectrum to set the peak window, or enter Fixed E "
+            "for an RC-at-energy map."
         )
         self.reflection_preview_status_label.setWordWrap(True)
         self.reflection_preview_status_label.setStyleSheet("color:#5a7088;")
@@ -1071,6 +1169,44 @@ class MainWindow(QMainWindow):
         form.addRow("", self.formula_label)
 
         # --- RC-specific rows (shown only when mode == "Reflection") ---
+        self._rc_fixed_energy_label = QLabel("Fixed E (eV):")
+        form.addRow(self._rc_fixed_energy_label, self.fixed_energy_spin)
+
+        self._rc_feature_label = QLabel("RC feature:")
+        form.addRow(self._rc_feature_label, self.rc_feature_combo)
+
+        background_scale_content = QWidget()
+        background_scale_form = QFormLayout(background_scale_content)
+        self._configure_sidebar_form(background_scale_form)
+        background_scale_form.addRow("", self.background_scale_check)
+        background_scale_form.addRow(
+            "Left min (eV):",
+            self.scale_left_min_spin,
+        )
+        background_scale_form.addRow(
+            "Left max (eV):",
+            self.scale_left_max_spin,
+        )
+        background_scale_form.addRow(
+            "Right min (eV):",
+            self.scale_right_min_spin,
+        )
+        background_scale_form.addRow(
+            "Right max (eV):",
+            self.scale_right_max_spin,
+        )
+        background_scale_form.addRow("", self.estimate_background_scale_btn)
+        background_scale_form.addRow(
+            "Status:",
+            self.background_scale_status_label,
+        )
+        self.background_scale_section = CollapsibleSection(
+            "Background Scaling",
+            background_scale_content,
+            expanded=False,
+        )
+        form.addRow(self.background_scale_section)
+
         self._rc_vbg_label = QLabel("Preview X:")
         form.addRow(self._rc_vbg_label, self.reflection_preview_vbg_spin)
 
@@ -1090,6 +1226,9 @@ class MainWindow(QMainWindow):
 
         # Hide RC rows by default (PL mode)
         self._rc_sidebar_widgets = [
+            self._rc_fixed_energy_label, self.fixed_energy_spin,
+            self._rc_feature_label, self.rc_feature_combo,
+            self.background_scale_section,
             self._rc_vbg_label, self.reflection_preview_vbg_spin,
             self._rc_vtg_label, self.reflection_preview_vtg_spin,
             self._rc_btn_placeholder, self.preview_rc_btn,
@@ -1132,8 +1271,8 @@ class MainWindow(QMainWindow):
         form.setContentsMargins(0, 8, 0, 0)
         self.intensity_group = group
 
-        self.int_min_spin = self._dspin(0.01, 10.0, 0.01, 3, 1.25)
-        self.int_max_spin = self._dspin(0.01, 10.0, 0.01, 3, 1.425)
+        self.int_min_spin = self._dspin(0.01, 10.0, 0.000001, 6, 1.25)
+        self.int_max_spin = self._dspin(0.01, 10.0, 0.000001, 6, 1.425)
         self.baseline_spin = self._dspin(0.0, 1e6, 1.0, 0, 595.0)
         self.int_min_spin.valueChanged.connect(self._on_energy_window_changed)
         self.int_max_spin.valueChanged.connect(self._on_energy_window_changed)
@@ -1343,22 +1482,35 @@ class MainWindow(QMainWindow):
             self._dirty_views[key] = False
 
     def _current_view_key(self) -> str:
-        map_kind = "intensity" if self.map_type_combo.currentIndex() == 0 else "peak"
+        map_label = self.map_type_combo.currentText()
+        if map_label == "Resistance":
+            map_kind = "resistance"
+        elif map_label == "Ibias":
+            map_kind = "ibias"
+        elif map_label == "RC at Energy":
+            map_kind = "fixed"
+        elif map_label in {"Peak Energy", "RC Peak Position"}:
+            map_kind = "peak"
+        else:
+            map_kind = "intensity"
         axes = "original" if self.map_axes_combo.currentText() == "Original" else "transformed"
         return f"{map_kind}_{axes}"
 
     def _current_view_description(self) -> str:
-        if self.map_type_combo.currentIndex() == 0:
-            label = "RC Peak-to-Peak" if self.state.mode == "Reflection" else "Intensity"
-        else:
-            label = "RC Peak Position" if self.state.mode == "Reflection" else "Peak Energy"
+        label = self.map_type_combo.currentText()
         return f"{label} on {self.map_axes_combo.currentText().lower()} axes"
 
-    def _compact_map_title(self, z_name: str) -> str:
+    def _compact_map_title(self, z_name: str, *, fixed_energy: float | None = None) -> str:
         """Return the approved concise title; source names stay in export filenames."""
+        if z_name == "Ibias":
+            return "Ibias"
+        if z_name == "Resistance":
+            return "R = Vbias / Ibias"
+        if fixed_energy is not None:
+            return f"{z_name} | E = {fixed_energy:.6f} eV"
         e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
         e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
-        return f"{z_name} | {e_lo:.3f}–{e_hi:.3f} eV"
+        return f"{z_name} | {e_lo:.6f}–{e_hi:.6f} eV"
 
     def _required_tasks_for_view(self, view_key: str) -> list[str]:
         match view_key:
@@ -1370,6 +1522,18 @@ class MainWindow(QMainWindow):
                 return ["intensity_original", "peak_original"]
             case "peak_transformed":
                 return ["intensity_original", "intensity_transformed", "peak_transformed"]
+            case "fixed_original":
+                return ["fixed_original"]
+            case "fixed_transformed":
+                return ["fixed_original", "fixed_transformed"]
+            case "ibias_original":
+                return ["ibias_original"]
+            case "ibias_transformed":
+                return ["ibias_transformed"]
+            case "resistance_original":
+                return ["resistance_original"]
+            case "resistance_transformed":
+                return ["resistance_transformed"]
         return ["intensity_original"]
 
     def _current_map_payload(self) -> dict | None:
@@ -1379,6 +1543,12 @@ class MainWindow(QMainWindow):
             "intensity_transformed": self.state.transformed_map,
             "peak_original": self.state.peak_map_original,
             "peak_transformed": self.state.peak_map_transformed,
+            "fixed_original": self.state.rc_fixed_map_original,
+            "fixed_transformed": self.state.rc_fixed_map_transformed,
+            "ibias_original": self.state.ibias_map_original,
+            "ibias_transformed": self.state.ibias_map_transformed,
+            "resistance_original": self.state.resistance_map_original,
+            "resistance_transformed": self.state.resistance_map_transformed,
         }
         return mapping.get(view_key)
 
@@ -1389,6 +1559,12 @@ class MainWindow(QMainWindow):
             "intensity_transformed": "transformed_map",
             "peak_original": "peak_map_original",
             "peak_transformed": "peak_map_transformed",
+            "fixed_original": "fixed_map_original",
+            "fixed_transformed": "fixed_map_transformed",
+            "ibias_original": "ibias_map_original",
+            "ibias_transformed": "ibias_map_transformed",
+            "resistance_original": "resistance_map_original",
+            "resistance_transformed": "resistance_map_transformed",
         }
         return self.state.figures.get(key_map[view_key])
 
@@ -1425,6 +1601,7 @@ class MainWindow(QMainWindow):
         self._show_current_map_view()
         self.save_current_png_btn.setEnabled(self._current_map_figure() is not None)
         self.save_current_csv_btn.setEnabled(self._current_map_payload() is not None)
+        self._refresh_stage_states()
 
     def _update_status_labels(self) -> None:
         if self.state.data is None:
@@ -1440,13 +1617,21 @@ class MainWindow(QMainWindow):
         dirty_names = {
             "intensity_original": "intensity/original",
             "peak_original": "peak/original",
+            "ibias_original": "Ibias/original",
+            "resistance_original": "resistance/original",
         }
+        if self.state.mode == "Reflection":
+            dirty_names["fixed_original"] = "RC at energy/original"
         if supports_de:
             dirty_names.update({
                 "intensity_transformed": "intensity/transformed",
                 "peak_transformed": "peak/transformed",
+                "ibias_transformed": "Ibias/transformed",
+                "resistance_transformed": "resistance/transformed",
                 "line_cuts": "line cuts",
             })
+            if self.state.mode == "Reflection":
+                dirty_names["fixed_transformed"] = "RC at energy/transformed"
         dirty_list = [label for key, label in dirty_names.items() if self._dirty_views.get(key, False)]
         if dirty_list:
             self.analysis_status_label.setText("Needs refresh: " + ", ".join(dirty_list) + ".")
@@ -1487,12 +1672,19 @@ class MainWindow(QMainWindow):
         if self.state.data is None:
             self._append_log("Load a CSV before refreshing map views.", "error")
             return
-        if self.int_min_spin.value() >= self.int_max_spin.value():
-            self._append_log("Intensity range is invalid: E min must be less than E max.", "error")
-            return
-        if not self._validate_reflection_background_ready():
-            return
         view_key = self._current_view_key()
+        is_electrical_view = view_key.startswith(
+            ("ibias_", "resistance_")
+        )
+        if not is_electrical_view:
+            if self.int_min_spin.value() >= self.int_max_spin.value():
+                self._append_log(
+                    "Intensity range is invalid: E min must be less than E max.",
+                    "error",
+                )
+                return
+            if not self._validate_reflection_background_ready():
+                return
         if view_key.endswith("_transformed") and self.state.data.get("axis_space") == "generic":
             self._append_log(
                 "D/E transformed views are unavailable for this sweep. Select Original axes.",
@@ -1512,8 +1704,24 @@ class MainWindow(QMainWindow):
         if not self._validate_reflection_background_ready():
             return
         tasks = ["intensity_original", "peak_original"]
+        has_ibias = self.state.data.get("ibias_data") is not None
+        has_resistance = (
+            has_ibias and self.state.data.get("vbias_data") is not None
+        )
+        if has_ibias:
+            tasks.append("ibias_original")
+        if has_resistance:
+            tasks.append("resistance_original")
+        if self.state.mode == "Reflection":
+            tasks.append("fixed_original")
         if self.state.data.get("axis_space") in {"gate", "transformed"}:
             tasks.extend(["intensity_transformed", "peak_transformed"])
+            if has_ibias:
+                tasks.append("ibias_transformed")
+            if has_resistance:
+                tasks.append("resistance_transformed")
+            if self.state.mode == "Reflection":
+                tasks.append("fixed_transformed")
         self._start_analysis_refresh(tasks, "Refreshing all map views")
 
     def _start_analysis_refresh(self, tasks: list[str], context: str) -> None:
@@ -1530,8 +1738,83 @@ class MainWindow(QMainWindow):
             mode=self.state.mode,
             background_spectra=self.state.background_spectra,
             convention=self._current_convention(),
+            fixed_energy=self.fixed_energy_spin.value(),
+            background_scale=(
+                self._effective_background_scale()
+                if self.state.mode == "Reflection"
+                else 1.0
+            ),
+            rc_feature_mode=self._current_rc_feature_mode(),
         )
         self._run_worker(worker, self._on_analysis_refresh_ready, context=context)
+
+    def _export_map_axes_size(self) -> tuple[float, float]:
+        return self._EXPORT_MAP_AXES_SIZE
+
+    @staticmethod
+    def _measured_map_arrays(payload: dict) -> tuple:
+        """Return only acquired points so CSV exports never invent missing rows."""
+        if all(key in payload for key in ("x_flat", "y_flat", "z_flat")):
+            return (
+                payload["x_flat"],
+                payload["y_flat"],
+                payload["z_flat"],
+            )
+        return payload["X2D"], payload["Y2D"], payload["Z2D"]
+
+    def _map_export_stem(
+        self,
+        payload: dict,
+        *,
+        axes_override: str | None = None,
+    ) -> str:
+        axes = axes_override or payload.get("target_axes", "original")
+        axes = str(axes).strip().lower() or "original"
+        z_name = str(payload.get("z_name", "")).strip().lower()
+        if z_name == "ibias":
+            return f"Ibias_{axes}"
+        if z_name == "resistance":
+            return f"Resistance_{axes}"
+        background_scale = float(payload.get("background_scale", 1.0))
+        rc_prefix = (
+            "RC_scaled"
+            if not np.isclose(background_scale, 1.0)
+            else "RC"
+        )
+        if "fixed_energy" in payload:
+            return (
+                f"{rc_prefix}_at_"
+                f"{float(payload['fixed_energy']):.6f}eV_{axes}"
+            )
+
+        e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
+        e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
+        energy_tag = f"{e_lo:.6f}-{e_hi:.6f}eV"
+        if "peak-to-peak" in z_name:
+            quantity = f"{rc_prefix}_P2P"
+        elif z_name.startswith("rc") and "position" in z_name:
+            feature_tag = {
+                "dip": "dip",
+                "peak": "peak",
+            }.get(self._current_rc_feature_mode(), "feature")
+            quantity = f"{rc_prefix}_{feature_tag}_position"
+        elif "peak energy" in z_name:
+            quantity = "PL_peak_energy"
+        elif "intensity" in z_name:
+            quantity = "PL_intensity"
+        else:
+            quantity = "map"
+        return f"{quantity}_{energy_tag}_{axes}"
+
+    def _export_file_path(self, filename: str) -> str:
+        path = os.path.abspath(os.path.join(self._ensure_output_dir(), filename))
+        if sys.platform == "win32" and len(path) >= 240:
+            raise OSError(
+                f"Export path is {len(path)} characters and may not open in "
+                "PowerPoint. Choose a shorter Output dir. "
+                f"Attempted path: {path}"
+            )
+        return path
 
     def _save_current_view(self, output_type: str) -> None:
         payload = self._current_map_payload()
@@ -1541,21 +1824,22 @@ class MainWindow(QMainWindow):
             return
         path = ""
         try:
-            base = self._ensure_output_dir()
-            source = self.state.data["source_name"]
-            axes_suffix = payload.get("target_axes", "original")
-            z_name = payload["z_name"]
-            e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
-            e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
-            e_tag = f"_{e_lo:.3f}to{e_hi:.3f}eV"
-            path = os.path.join(base, f"{source}_{z_name}{e_tag}_{axes_suffix}.{output_type}")
+            path = self._export_file_path(
+                f"{self._map_export_stem(payload)}.{output_type}"
+            )
             if output_type == "png":
-                save_figure(figure, path, dpi=300)
+                save_figure_with_axes_size(
+                    figure,
+                    path,
+                    self._export_map_axes_size(),
+                    dpi=300,
+                )
             else:
+                export_x, export_y, export_z = self._measured_map_arrays(payload)
                 save_map_csv(
-                    payload["X2D"],
-                    payload["Y2D"],
-                    payload["Z2D"],
+                    export_x,
+                    export_y,
+                    export_z,
                     path,
                     x_name=payload["x_name"],
                     y_name=payload["y_name"],
@@ -1580,8 +1864,68 @@ class MainWindow(QMainWindow):
             peak_map = self.state.peak_map_original if axes == "original" else self.state.peak_map_transformed
             if peak_map is not None:
                 current_index = self.map_type_combo.currentIndex(), self.map_axes_combo.currentIndex()
-                self.map_type_combo.setCurrentIndex(1)
+                self.map_type_combo.setCurrentText(
+                    "RC Peak Position" if self.state.mode == "Reflection" else "Peak Energy"
+                )
                 self.map_axes_combo.setCurrentText("Original" if axes == "original" else "Transformed")
+                self._save_current_view("png")
+                self._save_current_view("csv")
+                self.map_type_combo.setCurrentIndex(current_index[0])
+                self.map_axes_combo.setCurrentIndex(current_index[1])
+                saved_any = True
+        if self.state.mode == "Reflection":
+            for axes in ("original", "transformed"):
+                fixed_map = (
+                    self.state.rc_fixed_map_original
+                    if axes == "original"
+                    else self.state.rc_fixed_map_transformed
+                )
+                if fixed_map is not None:
+                    current_index = self.map_type_combo.currentIndex(), self.map_axes_combo.currentIndex()
+                    self.map_type_combo.setCurrentText("RC at Energy")
+                    self.map_axes_combo.setCurrentText(
+                        "Original" if axes == "original" else "Transformed"
+                    )
+                    self._save_current_view("png")
+                    self._save_current_view("csv")
+                    self.map_type_combo.setCurrentIndex(current_index[0])
+                    self.map_axes_combo.setCurrentIndex(current_index[1])
+                    saved_any = True
+        for axes in ("original", "transformed"):
+            ibias_map = (
+                self.state.ibias_map_original
+                if axes == "original"
+                else self.state.ibias_map_transformed
+            )
+            if ibias_map is not None:
+                current_index = (
+                    self.map_type_combo.currentIndex(),
+                    self.map_axes_combo.currentIndex(),
+                )
+                self.map_type_combo.setCurrentText("Ibias")
+                self.map_axes_combo.setCurrentText(
+                    "Original" if axes == "original" else "Transformed"
+                )
+                self._save_current_view("png")
+                self._save_current_view("csv")
+                self.map_type_combo.setCurrentIndex(current_index[0])
+                self.map_axes_combo.setCurrentIndex(current_index[1])
+                saved_any = True
+        for axes in ("original", "transformed"):
+            resistance_map = (
+                self.state.resistance_map_original
+                if axes == "original"
+                else self.state.resistance_map_transformed
+            )
+            if resistance_map is not None:
+                current_index = (
+                    self.map_type_combo.currentIndex(),
+                    self.map_axes_combo.currentIndex(),
+                )
+                self.map_type_combo.setCurrentText("Resistance")
+                self.map_axes_combo.setCurrentText(
+                    "Original" if axes == "original" else "Transformed"
+                )
                 self._save_current_view("png")
                 self._save_current_view("csv")
                 self.map_type_combo.setCurrentIndex(current_index[0])
@@ -1655,6 +1999,8 @@ class MainWindow(QMainWindow):
         if not self.out_edit.text().strip():
             self.out_edit.setText(os.path.dirname(path))
             self._on_output_dir_changed()
+        else:
+            self._update_output_destination_ui()
 
         self._append_log(
             f"Headers detected. Auto-selected Axis X={self.vbg_combo.currentText()} and "
@@ -1669,6 +2015,7 @@ class MainWindow(QMainWindow):
 
     def _on_csv_text_changed(self, text: str) -> None:
         self.csv_edit.setToolTip(text.strip())
+        self._update_output_destination_ui()
         self._refresh_stage_states()
 
     def _on_primary_csv_dropped(self, paths: list[str]) -> None:
@@ -1677,12 +2024,14 @@ class MainWindow(QMainWindow):
         self._set_primary_csv_path(paths[0])
 
     def _on_output_dir_changed(self) -> None:
-        self.state.output_dir = self.out_edit.text().strip()
-        self.out_edit.setToolTip(self.state.output_dir)
-        self.open_folder_btn.setToolTip(
-            f"Open {self.state.output_dir}" if self.state.output_dir else ""
+        requested = self.out_edit.text().strip()
+        self.state.output_dir = (
+            os.path.abspath(os.path.expanduser(requested)) if requested else ""
         )
-        self.open_folder_btn.setEnabled(bool(self.state.output_dir))
+        if requested and requested != self.state.output_dir:
+            self.out_edit.setText(self.state.output_dir)
+        self.out_edit.setToolTip(self.state.output_dir)
+        self._update_output_destination_ui()
 
     @staticmethod
     def _normalize_csv_paths(paths: list[str]) -> list[str]:
@@ -1746,6 +2095,12 @@ class MainWindow(QMainWindow):
         self.state.background_wavelength = None
         self.state.background_path = ""
         self.state.background_paths = []
+        self.state.background_scale_factor = None
+        self.state.background_scale_info = None
+        self.state.background_scale_frame_index = None
+        self.state.figures.pop("raw_background", None)
+        if hasattr(self, "raw_background_plot_tab"):
+            self.raw_background_plot_tab.clear()
         self.bg_status_label.setText(status_text)
 
     def _validate_reflection_background_ready(self) -> bool:
@@ -1766,7 +2121,183 @@ class MainWindow(QMainWindow):
                 "error",
             )
             return False
+        if (
+            self.background_scale_check.isChecked()
+            and self.state.background_scale_factor is None
+        ):
+            if not self._estimate_and_apply_background_scale(
+                log=True,
+                refresh_preview=False,
+            ):
+                return False
         return True
+
+    def _background_scale_windows(self) -> list[tuple[float, float]]:
+        return [
+            (
+                self.scale_left_min_spin.value(),
+                self.scale_left_max_spin.value(),
+            ),
+            (
+                self.scale_right_min_spin.value(),
+                self.scale_right_max_spin.value(),
+            ),
+        ]
+
+    def _effective_background_scale(self) -> float:
+        if not self.background_scale_check.isChecked():
+            return 1.0
+        scale = self.state.background_scale_factor
+        if scale is None or not np.isfinite(scale) or scale <= 0:
+            raise ValueError(
+                "Estimate the background scale before calculating RC."
+            )
+        return float(scale)
+
+    def _clear_rc_results_for_scale_change(self) -> None:
+        """Invalidate only results that depend on the reflection background."""
+        self.state.original_map = None
+        self.state.transformed_map = None
+        self.state.peak_map_original = None
+        self.state.peak_map_transformed = None
+        self.state.rc_fixed_map_original = None
+        self.state.rc_fixed_map_transformed = None
+        self.state.line_cut_specs = []
+        self.state.line_cut_results = []
+        for figure_key in (
+            "original_map",
+            "transformed_map",
+            "peak_map_original",
+            "peak_map_transformed",
+            "fixed_map_original",
+            "fixed_map_transformed",
+            "line_cuts",
+        ):
+            self.state.figures.pop(figure_key, None)
+        self._mark_dirty(
+            "intensity_original",
+            "intensity_transformed",
+            "peak_original",
+            "peak_transformed",
+            "fixed_original",
+            "fixed_transformed",
+            "line_cuts",
+        )
+        self.line_plot_tab.clear()
+
+    def _on_background_scale_enabled_changed(self, enabled: bool) -> None:
+        for widget in (
+            self.scale_left_min_spin,
+            self.scale_left_max_spin,
+            self.scale_right_min_spin,
+            self.scale_right_max_spin,
+            self.estimate_background_scale_btn,
+        ):
+            widget.setEnabled(enabled)
+        if self.state.data is None:
+            return
+        self._clear_rc_results_for_scale_change()
+        if enabled and self.state.background_spectra is not None:
+            self._estimate_and_apply_background_scale(
+                log=True,
+                refresh_preview=False,
+            )
+        else:
+            self.background_scale_status_label.setText(
+                "Scale correction off; α = 1"
+            )
+        try:
+            self._refresh_raw_background_plot()
+        except Exception as exc:
+            self._append_log(f"Raw/background refresh failed: {exc}", "error")
+        self._show_current_map_view()
+        self._refresh_stage_states()
+
+    def _on_background_scale_window_changed(self, _value: float) -> None:
+        self.state.background_scale_factor = None
+        self.state.background_scale_info = None
+        self.state.background_scale_frame_index = None
+        self.background_scale_status_label.setText(
+            "Scale α: window changed; estimate again"
+        )
+        if self.state.data is None:
+            return
+        self._clear_rc_results_for_scale_change()
+        try:
+            self._refresh_raw_background_plot()
+        except Exception:
+            pass
+        self._show_current_map_view()
+        self._refresh_stage_states()
+
+    def _estimate_and_apply_background_scale(
+        self,
+        _checked: bool = False,
+        *,
+        log: bool = True,
+        refresh_preview: bool = True,
+    ) -> bool:
+        if not self.background_scale_check.isChecked():
+            self.background_scale_status_label.setText(
+                "Scale correction off; α = 1"
+            )
+            return True
+        if self.state.data is None or self.state.background_spectra is None:
+            if log:
+                self._append_log(
+                    "Load the reflection CSV and background before estimating scale.",
+                    "error",
+                )
+            return False
+        try:
+            row_index, actual_x, actual_y = self._selected_reflection_frame()
+            scale, info = estimate_background_scale(
+                self.state.data["Intensity"][row_index],
+                self.state.background_spectra,
+                self.state.data["energy"],
+                self._background_scale_windows(),
+            )
+            self.state.background_scale_factor = scale
+            self.state.background_scale_info = info
+            self.state.background_scale_frame_index = row_index
+            relative_mad_percent = 100.0 * float(info["relative_mad"])
+            self.background_scale_status_label.setText(
+                f"α = {scale:.6g} | {info['channel_count']} channels | "
+                f"relative MAD {relative_mad_percent:.2f}%"
+            )
+            self._clear_rc_results_for_scale_change()
+            self._refresh_raw_background_plot(row_index, actual_x, actual_y)
+            if log:
+                left, right = info["windows"]
+                self._append_log(
+                    f"Background scale estimated: α={scale:.8g} from "
+                    f"{info['channel_count']} channels in left "
+                    f"{left[0]:.6f}-{left[1]:.6f} eV and right "
+                    f"{right[0]:.6f}-{right[1]:.6f} eV windows "
+                    f"(relative MAD {relative_mad_percent:.2f}%).",
+                    "success",
+                )
+                if relative_mad_percent > 10.0:
+                    self._append_log(
+                        "Raw/background scaling varies by more than 10% in the "
+                        "side windows. Check that both windows are feature-free.",
+                        "warn",
+                    )
+            if refresh_preview and self._reflection_preview_message is not None:
+                self._preview_reflection_spectra()
+            self._show_current_map_view()
+            self._refresh_stage_states()
+            return True
+        except Exception as exc:
+            self.state.background_scale_factor = None
+            self.state.background_scale_info = None
+            self.state.background_scale_frame_index = None
+            self.background_scale_status_label.setText(
+                f"Scale estimate failed: {exc}"
+            )
+            if log:
+                self._append_log(f"Background scale estimate failed: {exc}", "error")
+            return False
 
     def _clear_reflection_preview(self) -> None:
         self._reflection_preview_message = None
@@ -1794,6 +2325,171 @@ class MainWindow(QMainWindow):
                 if positive_steps.size:
                     spin.setSingleStep(float(np.median(positive_steps)))
             spin.setValue(float(finite[0]))
+
+    def _selected_reflection_frame(self) -> tuple[int, float, float]:
+        """Return the row nearest the requested reflection-preview coordinates."""
+        if self.state.data is None:
+            raise ValueError("Load a reflection CSV first.")
+        x_data = np.asarray(self.state.data["x_data"], dtype=float).reshape(-1)
+        y_data = np.asarray(self.state.data["y_data"], dtype=float).reshape(-1)
+        if x_data.size == 0 or y_data.size == 0 or x_data.size != y_data.size:
+            raise ValueError("No valid reflection sweep coordinates are available.")
+
+        finite_mask = np.isfinite(x_data) & np.isfinite(y_data)
+        if not np.any(finite_mask):
+            raise ValueError(
+                "Reflection dataset does not contain finite sweep-coordinate points."
+            )
+        target_x = float(self.reflection_preview_vbg_spin.value())
+        target_y = float(self.reflection_preview_vtg_spin.value())
+        finite_indices = np.flatnonzero(finite_mask)
+        distances = (
+            (x_data[finite_mask] - target_x) ** 2
+            + (y_data[finite_mask] - target_y) ** 2
+        )
+        row_index = int(finite_indices[int(np.argmin(distances))])
+        return row_index, float(x_data[row_index]), float(y_data[row_index])
+
+    def _refresh_raw_background_plot(
+        self,
+        row_index: int | None = None,
+        actual_x: float | None = None,
+        actual_y: float | None = None,
+    ) -> None:
+        """Plot one unnormalized raw spectrum with the averaged background."""
+        if (
+            self.state.data is None
+            or self.state.background_spectra is None
+            or self.state.background_wavelength is None
+        ):
+            self.state.figures.pop("raw_background", None)
+            self.raw_background_plot_tab.clear()
+            return
+
+        if row_index is None or actual_x is None or actual_y is None:
+            row_index, actual_x, actual_y = self._selected_reflection_frame()
+
+        wavelength = np.asarray(
+            self.state.data["wavelength"],
+            dtype=float,
+        ).reshape(-1)
+        background_wavelength = np.asarray(
+            self.state.background_wavelength,
+            dtype=float,
+        ).reshape(-1)
+        raw_spectrum = np.asarray(
+            self.state.data["Intensity"][row_index],
+            dtype=float,
+        ).reshape(-1)
+        averaged_background = np.asarray(
+            self.state.background_spectra,
+            dtype=float,
+        ).reshape(-1)
+        if not spectral_axes_match(wavelength, background_wavelength):
+            raise ValueError(
+                "Cannot plot raw/background comparison because their wavelength "
+                "channels do not match."
+            )
+        if (
+            raw_spectrum.size != wavelength.size
+            or averaged_background.size != wavelength.size
+        ):
+            raise ValueError(
+                "Raw spectrum, background, and wavelength arrays must have the "
+                "same number of channels."
+            )
+
+        order = np.argsort(wavelength)
+        wavelength_sorted = wavelength[order]
+        raw_sorted = raw_spectrum[order]
+        background_sorted = averaged_background[order]
+        max_delta = float(
+            np.max(np.abs(wavelength - background_wavelength))
+        )
+
+        fig = Figure(figsize=(7, 4.8))
+        ax = fig.add_subplot(111)
+        ax.plot(
+            wavelength_sorted,
+            raw_sorted,
+            color="#2563eb",
+            linewidth=1.5,
+            label="Selected raw spectrum",
+        )
+        ax.plot(
+            wavelength_sorted,
+            background_sorted,
+            color="#dc2626",
+            linewidth=1.5,
+            label="Averaged background",
+        )
+        scale = self.state.background_scale_factor
+        if (
+            self.background_scale_check.isChecked()
+            and scale is not None
+            and np.isfinite(scale)
+            and scale > 0
+        ):
+            ax.plot(
+                wavelength_sorted,
+                background_sorted * float(scale),
+                color="#16a34a",
+                linewidth=1.5,
+                linestyle="--",
+                label=f"Scaled background (α={float(scale):.5g})",
+            )
+
+        e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
+        e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
+        if e_lo > 0 and e_hi > 0:
+            wavelength_lo = 1240.0 / e_hi
+            wavelength_hi = 1240.0 / e_lo
+            ax.axvspan(
+                wavelength_lo,
+                wavelength_hi,
+                color="#fef08a",
+                alpha=0.18,
+                label="RC analysis window",
+            )
+        if self.background_scale_check.isChecked():
+            for index, (scale_lo, scale_hi) in enumerate(
+                self._background_scale_windows()
+            ):
+                if scale_lo > 0 and scale_hi > 0:
+                    ax.axvspan(
+                        1240.0 / max(scale_lo, scale_hi),
+                        1240.0 / min(scale_lo, scale_hi),
+                        color="#bbf7d0",
+                        alpha=0.20,
+                        label=(
+                            "Scale side windows"
+                            if index == 0
+                            else "_nolegend_"
+                        ),
+                    )
+
+        x_name = self.state.data.get("x_name", "X")
+        y_name = self.state.data.get("y_name", "Y")
+        ax.set_title(
+            f"Raw vs averaged background  "
+            f"{x_name} = {actual_x:.3f},  {y_name} = {actual_y:.3f}"
+        )
+        ax.set_xlabel("Wavelength (nm)")
+        ax.set_ylabel("Raw detector signal")
+        ax.grid(True, alpha=0.18)
+        ax.legend(loc="best")
+        ax.text(
+            0.01,
+            0.02,
+            f"{wavelength.size} matched channels; max |Δλ| = {max_delta:.6f} nm",
+            transform=ax.transAxes,
+            fontsize=9,
+            color="#475569",
+            verticalalignment="bottom",
+        )
+        fig.tight_layout()
+        self.state.figures["raw_background"] = fig
+        self.raw_background_plot_tab.set_figure(fig)
 
     def _on_rc_energy_span_selected(self, e_min: float, e_max: float) -> None:
         """Apply a dragged RC-preview span as the shared map energy window."""
@@ -1875,26 +2571,17 @@ class MainWindow(QMainWindow):
             from scipy.signal import savgol_filter as _sgf
             from megasweep_analysis import compute_rc_peak_position as _rc_peak_pos
 
-            rc_spectra = compute_rc_spectra(self.state.data["Intensity"], self.state.background_spectra)
-            x_data = np.asarray(self.state.data["x_data"], dtype=float).reshape(-1)
-            y_data = np.asarray(self.state.data["y_data"], dtype=float).reshape(-1)
+            rc_spectra = compute_rc_spectra(
+                self.state.data["Intensity"],
+                self.state.background_spectra,
+                background_scale=self._effective_background_scale(),
+            )
             energy = np.asarray(self.state.data["energy"], dtype=float).reshape(-1)
-            target_x = float(self.reflection_preview_vbg_spin.value())
-            target_y = float(self.reflection_preview_vtg_spin.value())
-
-            if x_data.size == 0 or y_data.size == 0 or rc_spectra.shape[0] == 0:
+            if rc_spectra.shape[0] == 0:
                 raise ValueError("No reflection points are available for RC preview.")
-
-            finite_mask = np.isfinite(x_data) & np.isfinite(y_data)
-            if not np.any(finite_mask):
-                raise ValueError("Reflection dataset does not contain any finite sweep-coordinate points.")
-
-            finite_indices = np.flatnonzero(finite_mask)
-            distances = (x_data[finite_mask] - target_x) ** 2 + (y_data[finite_mask] - target_y) ** 2
-            row_index = int(finite_indices[int(np.argmin(distances))])
-            actual_x = float(x_data[row_index])
-            actual_y = float(y_data[row_index])
+            row_index, actual_x, actual_y = self._selected_reflection_frame()
             spectrum = np.asarray(rc_spectra[row_index], dtype=float).reshape(-1)
+            self._refresh_raw_background_plot(row_index, actual_x, actual_y)
         except Exception:
             self._append_log(traceback.format_exc(), "error")
             return
@@ -1946,6 +2633,7 @@ class MainWindow(QMainWindow):
                 e_hi,
                 sg_window=self.sg_window_spin.value(),
                 sg_poly=self.sg_poly_spin.value(),
+                feature_mode=self._current_rc_feature_mode(),
             )
         except Exception:
             pk_energy, pk_value = float("nan"), float("nan")
@@ -1956,7 +2644,33 @@ class MainWindow(QMainWindow):
 
         ax.plot(energy, spectrum, color="#93c5fd", linewidth=1.0, alpha=0.7, label="Raw RC")
         ax.plot(energy, spectrum_smooth, color="#1d4ed8", linewidth=1.8, label="Smoothed")
-        ax.axvspan(e_lo, e_hi, color="#fef08a", alpha=0.25, label=f"Window [{e_lo:.3f}–{e_hi:.3f} eV]")
+        ax.axvspan(
+            e_lo,
+            e_hi,
+            color="#fef08a",
+            alpha=0.25,
+            label=f"Window [{e_lo:.6f}–{e_hi:.6f} eV]",
+        )
+        fixed_energy = self.fixed_energy_spin.value()
+        try:
+            fixed_rc = float(
+                compute_rc_at_energy_map(
+                    spectrum.reshape(1, -1),
+                    energy,
+                    fixed_energy,
+                )[0]
+            )
+        except ValueError:
+            fixed_rc = float("nan")
+        if np.isfinite(fixed_rc):
+            ax.axvline(
+                fixed_energy,
+                color="#7c3aed",
+                linestyle="-.",
+                linewidth=1.5,
+                label=f"Fixed E = {fixed_energy:.6f} eV",
+            )
+            ax.scatter([fixed_energy], [fixed_rc], color="#7c3aed", zorder=6, s=42)
 
         if np.isfinite(rc_max) and np.isfinite(e_max):
             ax.scatter([e_max], [rc_max], color="#dc2626", zorder=5, s=50, label=f"Max {rc_max:.4f}")
@@ -1970,9 +2684,14 @@ class MainWindow(QMainWindow):
                     label=f"P2P = {rc_p2p:.4f}",
                 )
         if np.isfinite(pk_energy) and np.isfinite(pk_value):
+            feature_label = {
+                "peak": "Peak",
+                "dip": "Dip",
+                "auto": "Feature",
+            }[self._current_rc_feature_mode()]
             ax.axvline(pk_energy, color="#16a34a", linestyle=":", linewidth=1.4)
             ax.annotate(
-                f"Peak\n{pk_energy:.4f} eV",
+                f"{feature_label}\n{pk_energy:.4f} eV",
                 xy=(pk_energy, pk_value),
                 xytext=(6, 6),
                 textcoords="offset points",
@@ -1981,7 +2700,7 @@ class MainWindow(QMainWindow):
             )
 
         ax.set_xlabel("Energy (eV)")
-        ax.set_ylabel("RC (ΔI/I₀)")
+        ax.set_ylabel("RC = (R - R_background) / R_background")
         x_label = self.state.data.get("x_name", "X")
         y_label = self.state.data.get("y_name", "Y")
         ax.set_title(f"RC spectrum  {x_label} = {actual_x:.3f},  {y_label} = {actual_y:.3f}")
@@ -2002,9 +2721,18 @@ class MainWindow(QMainWindow):
 
         p2p_str = f"{rc_p2p:.4f}" if np.isfinite(rc_p2p) else "n/a"
         pk_str = f"{pk_energy:.4f} eV" if np.isfinite(pk_energy) else "n/a"
+        fixed_str = f"{fixed_rc:.6g}" if np.isfinite(fixed_rc) else "out of range"
+        scale_str = (
+            f"{self._effective_background_scale():.6g}"
+            if self.background_scale_check.isChecked()
+            else "1 (off)"
+        )
         self._reflection_preview_message = (
             f"RC preview: {x_label}={actual_x:.3f}, {y_label}={actual_y:.3f} | "
-            f"Window={e_lo:.4f}-{e_hi:.4f} eV | P2P={p2p_str} | Peak={pk_str}. "
+            f"BG scale α={scale_str} | "
+            f"Window={e_lo:.6f}-{e_hi:.6f} eV | P2P={p2p_str} | "
+            f"{self.rc_feature_combo.currentText()}={pk_str} | "
+            f"RC({fixed_energy:.6f} eV)={fixed_str}. "
             "Drag horizontally to change the window."
         )
         self.reflection_preview_status_label.setText(self._reflection_preview_message)
@@ -2050,6 +2778,35 @@ class MainWindow(QMainWindow):
         elif self.auto_baseline_check.isChecked() and self.state.data is not None:
             self._estimate_and_apply_baseline(log=False, mark_dirty=False)
         self._on_intensity_settings_changed()
+        if (
+            self.state.mode == "Reflection"
+            and self.state.background_spectra is not None
+        ):
+            try:
+                self._refresh_raw_background_plot()
+            except Exception:
+                pass
+
+    def _on_fixed_energy_changed(self) -> None:
+        if self._suppress_fixed_energy_tracking:
+            return
+        self._fixed_energy_user_modified = True
+        if self.state.data is None:
+            return
+        self.state.rc_fixed_map_original = None
+        self.state.rc_fixed_map_transformed = None
+        self.state.figures.pop("fixed_map_original", None)
+        self.state.figures.pop("fixed_map_transformed", None)
+        self._mark_dirty("fixed_original", "fixed_transformed")
+        if self.state.mode == "Reflection" and self._reflection_preview_message is not None:
+            self._preview_reflection_spectra()
+        self._show_current_map_view()
+        self._append_log(
+            f"Fixed RC energy changed to {self.fixed_energy_spin.value():.6f} eV. "
+            "RC-at-energy views need refresh.",
+            "warn",
+        )
+        self._refresh_stage_states()
 
     def _on_baseline_changed(self) -> None:
         if not self._suppress_baseline_tracking:
@@ -2109,13 +2866,26 @@ class MainWindow(QMainWindow):
             self._clear_reflection_preview()
         self.state.transformed_map = None
         self.state.peak_map_transformed = None
+        self.state.rc_fixed_map_transformed = None
+        self.state.ibias_map_transformed = None
+        self.state.resistance_map_transformed = None
         self.state.line_cut_specs = []
         self.state.line_cut_results = []
         self.state.figures.pop("transformed_map", None)
         self.state.figures.pop("peak_map_transformed", None)
+        self.state.figures.pop("fixed_map_transformed", None)
+        self.state.figures.pop("ibias_map_transformed", None)
+        self.state.figures.pop("resistance_map_transformed", None)
         self.state.figures.pop("line_cuts", None)
         self.line_plot_tab.clear()
-        self._mark_dirty("intensity_transformed", "peak_transformed", "line_cuts")
+        self._mark_dirty(
+            "intensity_transformed",
+            "peak_transformed",
+            "fixed_transformed",
+            "ibias_transformed",
+            "resistance_transformed",
+            "line_cuts",
+        )
         self._append_log(
             "Ratio changed. Transformed views and line cuts need refresh.",
             "warn",
@@ -2130,13 +2900,26 @@ class MainWindow(QMainWindow):
             return
         self.state.transformed_map = None
         self.state.peak_map_transformed = None
+        self.state.rc_fixed_map_transformed = None
+        self.state.ibias_map_transformed = None
+        self.state.resistance_map_transformed = None
         self.state.line_cut_specs = []
         self.state.line_cut_results = []
         self.state.figures.pop("transformed_map", None)
         self.state.figures.pop("peak_map_transformed", None)
+        self.state.figures.pop("fixed_map_transformed", None)
+        self.state.figures.pop("ibias_map_transformed", None)
+        self.state.figures.pop("resistance_map_transformed", None)
         self.state.figures.pop("line_cuts", None)
         self.line_plot_tab.clear()
-        self._mark_dirty("intensity_transformed", "peak_transformed", "line_cuts")
+        self._mark_dirty(
+            "intensity_transformed",
+            "peak_transformed",
+            "fixed_transformed",
+            "ibias_transformed",
+            "resistance_transformed",
+            "line_cuts",
+        )
         self._append_log(
             f"Axis convention changed to '{convention}'. Transformed views and line cuts need refresh.",
             "warn",
@@ -2146,6 +2929,17 @@ class MainWindow(QMainWindow):
     def _current_convention(self) -> str:
         """Return the internal convention key for the current combo selection."""
         return "TG+rBG" if self.convention_combo.currentIndex() == 0 else "rTG+BG"
+
+    def _current_rc_feature_mode(self) -> str:
+        mode = self.rc_feature_combo.currentData()
+        return str(mode or "auto")
+
+    def _rc_feature_position_name(self) -> str:
+        return {
+            "auto": "RC Feature Position",
+            "peak": "RC Peak Position",
+            "dip": "RC Dip Position",
+        }[self._current_rc_feature_mode()]
 
     def _formula_text(self) -> str:
         """Return the D/E definition text for the current convention."""
@@ -2344,20 +3138,16 @@ class MainWindow(QMainWindow):
             self._append_log(axis_status["message"], "warn")
 
         self.state.csv_path = csv_path
-        csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
         requested_output_dir = self.out_edit.text().strip()
         if requested_output_dir:
             self.state.output_dir = os.path.abspath(
                 os.path.expanduser(requested_output_dir)
             )
         else:
-            self.state.output_dir = os.path.join(
-                os.path.dirname(csv_path),
-                f"{csv_stem}_outputs",
-            )
+            self.state.output_dir = os.path.dirname(os.path.abspath(csv_path))
         self.out_edit.setText(self.state.output_dir)
         self.out_edit.setToolTip(self.state.output_dir)
-        self.open_folder_btn.setToolTip(f"Open {self.state.output_dir}")
+        self._update_output_destination_ui()
         self.state.selected_x_col = vbg
         self.state.selected_y_col = vtg
         if axis_status["mode"] == "raw_gate":
@@ -2447,6 +3237,11 @@ class MainWindow(QMainWindow):
             tg_is_y=True,
             background_spectra=self.state.background_spectra if self.state.mode == "Reflection" else None,
             convention=self._current_convention(),
+            background_scale=(
+                self._effective_background_scale()
+                if self.state.mode == "Reflection"
+                else 1.0
+            ),
         )
         self._run_worker(worker, self._on_lines_ready, context="Extracting line cuts")
 
@@ -2553,11 +3348,15 @@ class MainWindow(QMainWindow):
             cut_types,
             epsilon,
             output_dir,
-            self.state.data["source_name"],
             self.state.current_ratio,
             tg_is_y=True,
             background_spectra=self.state.background_spectra if self.state.mode == "Reflection" else None,
             convention=self._current_convention(),
+            background_scale=(
+                self._effective_background_scale()
+                if self.state.mode == "Reflection"
+                else 1.0
+            ),
         )
         context = f"Batch extracting {' + '.join(cut_types)} line cuts"
         self._run_worker(worker, self._on_batch_lines_ready, context=context)
@@ -2643,6 +3442,9 @@ class MainWindow(QMainWindow):
         self.load_csv_btn.setEnabled(enabled)
         self.load_bg_btn.setEnabled(enabled)
         self.preview_rc_btn.setEnabled(enabled)
+        self.estimate_background_scale_btn.setEnabled(
+            enabled and self.background_scale_check.isChecked()
+        )
         self.refresh_current_btn.setEnabled(enabled)
         self.refresh_all_maps_btn.setEnabled(enabled)
         self.plot_lines_btn.setEnabled(enabled)
@@ -2650,20 +3452,50 @@ class MainWindow(QMainWindow):
         self.extract_all_efield_btn.setEnabled(enabled)
         self.extract_all_both_btn.setEnabled(enabled)
 
+    def _dataset_output_dir(self) -> str:
+        """Return the active full-condition per-CSV folder without creating it."""
+        csv_path = self.csv_edit.text().strip() or self.state.csv_path
+        base_dir = self.state.output_dir or self.out_edit.text().strip()
+        if not base_dir and csv_path:
+            base_dir = os.path.dirname(os.path.abspath(csv_path))
+        if not base_dir:
+            return ""
+
+        base_dir = os.path.abspath(os.path.expanduser(base_dir))
+        if not csv_path:
+            return base_dir
+        return resolve_dataset_output_dir(base_dir, csv_path)
+
+    def _update_output_destination_ui(self) -> None:
+        if not hasattr(self, "active_output_label"):
+            return
+        output_dir = self._dataset_output_dir()
+        if output_dir:
+            display_path = os.path.normpath(output_dir)
+            self.active_output_label.setText(display_path)
+            self.active_output_label.setToolTip(display_path)
+            self.open_folder_btn.setToolTip(f"Open {display_path}")
+            self.open_folder_btn.setEnabled(True)
+        else:
+            message = "Select a CSV to determine its results subfolder."
+            self.active_output_label.setText(message)
+            self.active_output_label.setToolTip("")
+            self.open_folder_btn.setToolTip("")
+            self.open_folder_btn.setEnabled(False)
+
     def _ensure_output_dir(self) -> str:
-        if self.state.output_dir:
-            os.makedirs(self.state.output_dir, exist_ok=True)
-            return self.state.output_dir
-        if self.state.csv_path:
-            csv_stem = os.path.splitext(os.path.basename(self.state.csv_path))[0]
-            output_dir = os.path.join(os.path.dirname(os.path.abspath(self.state.csv_path)), f"{csv_stem}_outputs")
-            self.state.output_dir = output_dir
+        output_dir = self._dataset_output_dir()
+        if not output_dir:
+            raise ValueError("Select an output base folder and load a CSV first.")
+        try:
             os.makedirs(output_dir, exist_ok=True)
-            self.out_edit.setText(output_dir)
-            self.out_edit.setToolTip(output_dir)
-            self.open_folder_btn.setToolTip(f"Open {output_dir}")
-            return output_dir
-        raise ValueError("No output directory set and no CSV loaded.")
+        except OSError as exc:
+            raise OSError(
+                f"Could not create dataset output folder '{output_dir}'. "
+                f"Choose a shorter writable Output dir. {exc}"
+            ) from exc
+        self._update_output_destination_ui()
+        return output_dir
 
     def _open_output_folder(self) -> None:
         try:
@@ -2687,7 +3519,11 @@ class MainWindow(QMainWindow):
             )
         self._dirty_views = {k: True for k in self._dirty_views.keys()}
         self._clear_reflection_preview()
-        for plot_tab in [self.map_plot_tab, self.line_plot_tab]:
+        for plot_tab in [
+            self.map_plot_tab,
+            self.line_plot_tab,
+            self.raw_background_plot_tab,
+        ]:
             plot_tab.clear()
         self._append_log(message, "warn")
         self._refresh_stage_states()
@@ -2709,9 +3545,22 @@ class MainWindow(QMainWindow):
             self.state.unique_x_count = len(np.unique(x_data))
             self.state.unique_y_count = len(np.unique(y_data))
             self._configure_reflection_preview_coordinates()
-            
+
+            energy_sorted = np.sort(energy[np.isfinite(energy)])
+            fixed_min = float(energy_sorted[0])
+            fixed_max = float(energy_sorted[-1])
+            requested_fixed_energy = self.fixed_energy_spin.value()
+            use_fixed_default = (
+                not self._fixed_energy_user_modified
+                or not fixed_min <= requested_fixed_energy <= fixed_max
+            )
+            self._suppress_fixed_energy_tracking = True
+            self.fixed_energy_spin.setRange(fixed_min, fixed_max)
+            if use_fixed_default:
+                self.fixed_energy_spin.setValue(float(np.median(energy_sorted)))
+            self._suppress_fixed_energy_tracking = False
+
             if not self._intensity_range_user_modified:
-                energy_sorted = np.sort(energy[np.isfinite(energy)])
                 if len(energy_sorted) >= 10:
                     e_lo = float(np.percentile(energy_sorted, 10))
                     e_hi = float(np.percentile(energy_sorted, 90))
@@ -2722,6 +3571,32 @@ class MainWindow(QMainWindow):
                 self.int_max_spin.setValue(e_hi)
                 self._suppress_intensity_tracking = False
                 self._intensity_defaults_csv_signature = (data.get("source_name", ""), e_lo, e_hi, self.state.spectral_channel_count)
+
+            scale_min = float(energy_sorted[0])
+            scale_max = float(energy_sorted[-1])
+            feature_lo = max(scale_min, self.int_min_spin.value())
+            feature_hi = min(scale_max, self.int_max_spin.value())
+            if feature_lo <= scale_min:
+                feature_lo = float(np.percentile(energy_sorted, 20))
+            if feature_hi >= scale_max:
+                feature_hi = float(np.percentile(energy_sorted, 80))
+            scale_defaults = (
+                (self.scale_left_min_spin, scale_min),
+                (self.scale_left_max_spin, feature_lo),
+                (self.scale_right_min_spin, feature_hi),
+                (self.scale_right_max_spin, scale_max),
+            )
+            for spin, value in scale_defaults:
+                was_blocked = spin.blockSignals(True)
+                spin.setRange(scale_min, scale_max)
+                spin.setValue(value)
+                spin.blockSignals(was_blocked)
+            self.state.background_scale_factor = None
+            self.state.background_scale_info = None
+            self.state.background_scale_frame_index = None
+            self.background_scale_status_label.setText(
+                "Scale α: estimate from the left + right side windows"
+            )
             
             if self.auto_baseline_check.isChecked() and self.state.mode != "Reflection":
                 self._estimate_and_apply_baseline(log=True, mark_dirty=False)
@@ -2732,9 +3607,13 @@ class MainWindow(QMainWindow):
             
             summary_text = (
                 f"{self.state.row_count} rows × {self.state.spectral_channel_count} channels | "
-                f"E: {self.state.energy_range[0]:.3f}–{self.state.energy_range[1]:.3f} eV | "
+                f"E: {self.state.energy_range[0]:.6f}–{self.state.energy_range[1]:.6f} eV | "
                 f"Grid: {self.state.unique_x_count}×{self.state.unique_y_count}"
             )
+            if data.get("ibias_name"):
+                summary_text += f" | Ibias: {data['ibias_name']}"
+            if data.get("ibias_name") and data.get("vbias_name"):
+                summary_text += f" | R uses: {data['vbias_name']}/Ibias"
             axis_status = validate_axis_selection(data.get("x_name", ""), data.get("y_name", ""))
             if axis_status["mode"] == "raw_gate":
                 summary_text += " | Axes: X=BG/Vbg, Y=TG/Vtg"
@@ -2783,6 +3662,11 @@ class MainWindow(QMainWindow):
             self._dirty_views = {k: True for k in self._dirty_views.keys()}
             self._refresh_stage_states()
             self._append_log(f"CSV loaded: {data.get('source_name', 'unknown')}", "success")
+            self._update_output_destination_ui()
+            self._append_log(
+                f"Dataset outputs will be saved to: {self._dataset_output_dir()}",
+                "info",
+            )
             self.data_section.set_expanded(False)
             if self.state.mode == "Reflection":
                 self.bg_section.set_expanded(True)
@@ -2800,7 +3684,18 @@ class MainWindow(QMainWindow):
             vmax_val = None if self.map_auto_scale_check.isChecked() else self.map_vmax_spin.value()
             is_rc = self.state.mode == "Reflection"
             for map_key, map_data in payload.items():
-                if map_key not in ["original_map", "transformed_map", "peak_map_original", "peak_map_transformed"]:
+                if map_key not in [
+                    "original_map",
+                    "transformed_map",
+                    "peak_map_original",
+                    "peak_map_transformed",
+                    "fixed_map_original",
+                    "fixed_map_transformed",
+                    "ibias_map_original",
+                    "ibias_map_transformed",
+                    "resistance_map_original",
+                    "resistance_map_transformed",
+                ]:
                     continue
 
                 try:
@@ -2833,8 +3728,12 @@ class MainWindow(QMainWindow):
                         self.state.peak_map_original = map_data
                         x_name = self.state.data.get("x_name", "x")
                         y_name = self.state.data.get("y_name", "y")
-                        z_name = "RC Peak Position" if is_rc else "Peak Energy"
-                        z_label = "RC Peak Position (eV)" if is_rc else "Peak Energy (eV)"
+                        z_name = (
+                            self._rc_feature_position_name()
+                            if is_rc
+                            else "Peak Energy"
+                        )
+                        z_label = f"{z_name} (eV)"
                         title = self._compact_map_title(z_name)
                         self._dirty_views["peak_original"] = False
                         figure_key = "peak_map_original"
@@ -2846,11 +3745,92 @@ class MainWindow(QMainWindow):
                             y_name = self.state.data.get("y_name", "efield")
                         else:
                             x_name, y_name = self._axis_labels()
-                        z_name = "RC Peak Position" if is_rc else "Peak Energy"
-                        z_label = "RC Peak Position (eV)" if is_rc else "Peak Energy (eV)"
+                        z_name = (
+                            self._rc_feature_position_name()
+                            if is_rc
+                            else "Peak Energy"
+                        )
+                        z_label = f"{z_name} (eV)"
                         title = self._compact_map_title(z_name)
                         self._dirty_views["peak_transformed"] = False
                         figure_key = "peak_map_transformed"
+
+                    elif map_key == "fixed_map_original":
+                        self.state.rc_fixed_map_original = map_data
+                        x_name = self.state.data.get("x_name", "x")
+                        y_name = self.state.data.get("y_name", "y")
+                        fixed_energy = float(map_data["fixed_energy"])
+                        z_name = "RC"
+                        z_label = f"RC at {fixed_energy:.6f} eV"
+                        title = self._compact_map_title(
+                            z_name,
+                            fixed_energy=fixed_energy,
+                        )
+                        self._dirty_views["fixed_original"] = False
+                        figure_key = "fixed_map_original"
+
+                    elif map_key == "fixed_map_transformed":
+                        self.state.rc_fixed_map_transformed = map_data
+                        if self.state.data.get("axis_space") == "transformed":
+                            x_name = self.state.data.get("x_name", "doping")
+                            y_name = self.state.data.get("y_name", "efield")
+                        else:
+                            x_name, y_name = self._axis_labels()
+                        fixed_energy = float(map_data["fixed_energy"])
+                        z_name = "RC"
+                        z_label = f"RC at {fixed_energy:.6f} eV"
+                        title = self._compact_map_title(
+                            z_name,
+                            fixed_energy=fixed_energy,
+                        )
+                        self._dirty_views["fixed_transformed"] = False
+                        figure_key = "fixed_map_transformed"
+
+                    elif map_key == "ibias_map_original":
+                        self.state.ibias_map_original = map_data
+                        x_name = self.state.data.get("x_name", "x")
+                        y_name = self.state.data.get("y_name", "y")
+                        z_name = "Ibias"
+                        z_label = "Ibias (A)"
+                        title = self._compact_map_title(z_name)
+                        self._dirty_views["ibias_original"] = False
+                        figure_key = "ibias_map_original"
+
+                    elif map_key == "ibias_map_transformed":
+                        self.state.ibias_map_transformed = map_data
+                        if self.state.data.get("axis_space") == "transformed":
+                            x_name = self.state.data.get("x_name", "doping")
+                            y_name = self.state.data.get("y_name", "efield")
+                        else:
+                            x_name, y_name = self._axis_labels()
+                        z_name = "Ibias"
+                        z_label = "Ibias (A)"
+                        title = self._compact_map_title(z_name)
+                        self._dirty_views["ibias_transformed"] = False
+                        figure_key = "ibias_map_transformed"
+
+                    elif map_key == "resistance_map_original":
+                        self.state.resistance_map_original = map_data
+                        x_name = self.state.data.get("x_name", "x")
+                        y_name = self.state.data.get("y_name", "y")
+                        z_name = "Resistance"
+                        z_label = "R = Vbias / Ibias (Ω)"
+                        title = self._compact_map_title(z_name)
+                        self._dirty_views["resistance_original"] = False
+                        figure_key = "resistance_map_original"
+
+                    elif map_key == "resistance_map_transformed":
+                        self.state.resistance_map_transformed = map_data
+                        if self.state.data.get("axis_space") == "transformed":
+                            x_name = self.state.data.get("x_name", "doping")
+                            y_name = self.state.data.get("y_name", "efield")
+                        else:
+                            x_name, y_name = self._axis_labels()
+                        z_name = "Resistance"
+                        z_label = "R = Vbias / Ibias (Ω)"
+                        title = self._compact_map_title(z_name)
+                        self._dirty_views["resistance_transformed"] = False
+                        figure_key = "resistance_map_transformed"
 
                     else:
                         continue
@@ -2917,6 +3897,9 @@ class MainWindow(QMainWindow):
             self.state.background_path = result.get("background_path", "")
             self.state.background_paths = result.get("background_paths", [])
             self.state.background_average_mode = result.get("average_mode", "all_frames")
+            self.state.background_scale_factor = None
+            self.state.background_scale_info = None
+            self.state.background_scale_frame_index = None
             n_spectra = result.get("spectrum_count", "?")
             n_channels = np.asarray(self.state.background_spectra).shape[0]
             self.bg_status_label.setText(
@@ -2928,16 +3911,23 @@ class MainWindow(QMainWindow):
                 "success",
             )
             self._append_log(
-                "Reflection contrast is computed for every frame as RC = "
-                "(CSV spectrum - background) / background.",
+                "Reflection contrast is computed wavelength-by-wavelength as "
+                "RC = (R - R_background) / R_background.",
                 "info",
             )
             self.reflection_preview_status_label.setText(
-                "Background ready. Preview one RC frame, then drag across its "
-                "spectrum to set the peak-to-peak and peak-position energy window."
+                "Background ready. Preview one RC frame; drag to set the peak "
+                "window or enter Fixed E for the RC-at-energy map."
             )
             # Invalidate any previously computed maps since background changed
             self._invalidate_from_stage(2, "Background updated – RC maps need refresh.")
+            if self.background_scale_check.isChecked():
+                self._estimate_and_apply_background_scale(
+                    log=True,
+                    refresh_preview=False,
+                )
+            else:
+                self._refresh_raw_background_plot()
             self.bg_section.set_expanded(False)
             self.analysis_section.set_expanded(True)
             self.sidebar_scroll.ensureWidgetVisible(self.analysis_section, 0, 16)
@@ -2949,9 +3939,44 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self, mode: str) -> None:
         self.state.mode = mode
         is_rc = mode == "Reflection"
+        self.workspace_tabs.setTabVisible(
+            self.raw_background_tab_index,
+            is_rc,
+        )
 
-        self.map_type_combo.setItemText(0, "RC Peak-to-Peak" if is_rc else "Intensity")
-        self.map_type_combo.setItemText(1, "RC Peak Position" if is_rc else "Peak Energy")
+        previous_map_type = self.map_type_combo.currentText()
+        was_blocked = self.map_type_combo.blockSignals(True)
+        self.map_type_combo.clear()
+        if is_rc:
+            self.map_type_combo.addItems(
+                [
+                    "RC Peak-to-Peak",
+                    "RC at Energy",
+                    "RC Peak Position",
+                    "Ibias",
+                    "Resistance",
+                ]
+            )
+            if previous_map_type in {
+                "RC Peak-to-Peak",
+                "RC at Energy",
+                "RC Peak Position",
+                "Ibias",
+                "Resistance",
+            }:
+                self.map_type_combo.setCurrentText(previous_map_type)
+        else:
+            self.map_type_combo.addItems(
+                ["Intensity", "Peak Energy", "Ibias", "Resistance"]
+            )
+            if previous_map_type in {
+                "Intensity",
+                "Peak Energy",
+                "Ibias",
+                "Resistance",
+            }:
+                self.map_type_combo.setCurrentText(previous_map_type)
+        self.map_type_combo.blockSignals(was_blocked)
 
         # Show/hide background section
         self.bg_section.setVisible(is_rc)
@@ -2963,7 +3988,7 @@ class MainWindow(QMainWindow):
             self.export_section.toggle.setText("5  Export")
             self.workflow_hint_label.setText(
                 "1. Load data  →  2. Load background  →  3. Preview one RC frame "
-                "and select energy  →  4. Refresh a map"
+                "and select a window or fixed energy  →  4. Refresh a map"
             )
             self.sidebar_scroll.ensureWidgetVisible(self.bg_section, 0, 16)
         else:
@@ -2984,11 +4009,12 @@ class MainWindow(QMainWindow):
 
         # Set sensible default colormap
         self.map_cmap_combo.setCurrentText("RdBu_r" if is_rc else "jet")
+        self._show_current_map_view()
 
         if is_rc:
             self.reflection_preview_status_label.setText(
                 "Load CSV + background, choose X/Y, then preview one RC frame. "
-                "Drag across the spectrum to set the shared energy window."
+                "Drag to set the peak window or enter Fixed E for an RC-at-energy map."
             )
 
         if not is_rc and self.state.data is not None and self.auto_baseline_check.isChecked():
@@ -3008,7 +4034,10 @@ class MainWindow(QMainWindow):
             has_data = self.state.data is not None
             is_rc = self.state.mode == "Reflection"
             has_background = self.state.background_spectra is not None
-            has_original_map = self.state.original_map is not None
+            electrical_selected = self.map_type_combo.currentText() in {
+                "Ibias",
+                "Resistance",
+            }
             has_transformed_map = self.state.transformed_map is not None and not self._dirty_views.get("intensity_transformed", True)
             supports_de = bool(
                 has_data and self.state.data.get("axis_space") in {"gate", "transformed"}
@@ -3018,7 +4047,20 @@ class MainWindow(QMainWindow):
             self.load_csv_btn.setEnabled(bool(csv_is_file))
             self.load_bg_btn.setEnabled(bool(has_data and is_rc))
             self.preview_rc_btn.setEnabled(bool(has_data and is_rc and has_background))
-            self.refresh_current_btn.setEnabled(bool(has_data and (not is_rc or has_background)))
+            self.estimate_background_scale_btn.setEnabled(
+                bool(
+                    has_data
+                    and is_rc
+                    and has_background
+                    and self.background_scale_check.isChecked()
+                )
+            )
+            self.refresh_current_btn.setEnabled(
+                bool(
+                    has_data
+                    and (electrical_selected or not is_rc or has_background)
+                )
+            )
             self.refresh_all_maps_btn.setEnabled(bool(has_data and (not is_rc or has_background)))
             self.plot_lines_btn.setEnabled(supports_de)
             self.batch_preview_btn.setEnabled(supports_de)
@@ -3029,7 +4071,22 @@ class MainWindow(QMainWindow):
             save_enabled = bool(self._current_map_figure() is not None)
             self.save_current_png_btn.setEnabled(save_enabled)
             self.save_current_csv_btn.setEnabled(bool(self._current_map_payload() is not None))
-            self.save_all_maps_btn.setEnabled(bool(has_original_map))
+            has_any_map = any(
+                map_data is not None
+                for map_data in (
+                    self.state.original_map,
+                    self.state.transformed_map,
+                    self.state.peak_map_original,
+                    self.state.peak_map_transformed,
+                    self.state.rc_fixed_map_original,
+                    self.state.rc_fixed_map_transformed,
+                    self.state.ibias_map_original,
+                    self.state.ibias_map_transformed,
+                    self.state.resistance_map_original,
+                    self.state.resistance_map_transformed,
+                )
+            )
+            self.save_all_maps_btn.setEnabled(has_any_map)
             has_lines = self.state.figures.get("line_cuts") is not None
             self.save_lines_png_btn.setEnabled(has_lines)
             self.save_lines_csv_btn.setEnabled(bool(self.state.line_cut_results))
@@ -3136,7 +4193,11 @@ class MainWindow(QMainWindow):
             self._dirty_views["line_cuts"] = False
             is_rc = self.state.mode == "Reflection"
             cmap = "RdBu_r" if is_rc else "jet"
-            z_label = "RC (ΔI/I₀)" if is_rc else "PL Intensity (a.u.)"
+            z_label = (
+                "RC = (R - R_background) / R_background"
+                if is_rc
+                else "PL Intensity (a.u.)"
+            )
 
             # Pick the first multi-row cut for the preview figure
             preview_cut = next(
@@ -3192,18 +4253,23 @@ class MainWindow(QMainWindow):
             return
         path = ""
         try:
-            base = self._ensure_output_dir()
-            source = self.state.data["source_name"]
             z_name = map_payload.get("z_name", kind)
-            e_lo = min(self.int_min_spin.value(), self.int_max_spin.value())
-            e_hi = max(self.int_min_spin.value(), self.int_max_spin.value())
-            e_tag = f"_{e_lo:.3f}to{e_hi:.3f}eV"
-            path = os.path.join(base, f"{source}_{z_name}{e_tag}_{kind}.{output_type}")
+            path = self._export_file_path(
+                f"{self._map_export_stem(map_payload, axes_override=kind)}.{output_type}"
+            )
             if output_type == "png":
-                save_figure(figure, path, dpi=300)
+                save_figure_with_axes_size(
+                    figure,
+                    path,
+                    self._export_map_axes_size(),
+                    dpi=300,
+                )
             else:
+                export_x, export_y, export_z = self._measured_map_arrays(
+                    map_payload
+                )
                 save_map_csv(
-                    map_payload["X2D"], map_payload["Y2D"], map_payload["Z2D"],
+                    export_x, export_y, export_z,
                     path,
                     x_name=map_payload.get("x_name", "x"),
                     y_name=map_payload.get("y_name", "y"),
@@ -3227,10 +4293,21 @@ class MainWindow(QMainWindow):
         if figure is None or map_data is None:
             self._append_log("No peak map available to save.", "warn")
             return
-        base = self._ensure_output_dir()
-        source = self.state.data["source_name"]
-        path = os.path.join(base, f"{source}_peak_{axes}.png")
-        save_figure(figure, path, dpi=300)
+        export_payload = dict(map_data)
+        export_payload.setdefault("target_axes", axes)
+        export_payload.setdefault(
+            "z_name",
+            "RC Peak Position" if self.state.mode == "Reflection" else "Peak Energy",
+        )
+        path = self._export_file_path(
+            f"{self._map_export_stem(export_payload, axes_override=axes)}.png"
+        )
+        save_figure_with_axes_size(
+            figure,
+            path,
+            self._export_map_axes_size(),
+            dpi=300,
+        )
         self._append_log(f"Saved PNG: {path}", "success")
 
     def _save_peak_csv(self) -> None:
@@ -3241,11 +4318,18 @@ class MainWindow(QMainWindow):
             map_data = getattr(self.state, attr)
             if map_data is None:
                 continue
-            base = self._ensure_output_dir()
-            source = self.state.data["source_name"]
-            path = os.path.join(base, f"{source}_peak_{axes}.csv")
+            export_payload = dict(map_data)
+            export_payload.setdefault("target_axes", axes)
+            export_payload.setdefault(
+                "z_name",
+                "RC Peak Position" if self.state.mode == "Reflection" else "Peak Energy",
+            )
+            path = self._export_file_path(
+                f"{self._map_export_stem(export_payload, axes_override=axes)}.csv"
+            )
+            export_x, export_y, export_z = self._measured_map_arrays(map_data)
             save_map_csv(
-                map_data["X2D"], map_data["Y2D"], map_data["Z2D"],
+                export_x, export_y, export_z,
                 path,
                 x_name=map_data.get("x_name", "x"),
                 y_name=map_data.get("y_name", "y"),
@@ -3258,9 +4342,7 @@ class MainWindow(QMainWindow):
         if figure is None:
             self._append_log("No line-cut figure available to save.", "warn")
             return
-        base = self._ensure_output_dir()
-        source = self.state.data["source_name"]
-        path = os.path.join(base, f"{source}_linecuts.png")
+        path = self._export_file_path("linecuts.png")
         save_figure(figure, path, dpi=300)
         self._append_log(f"Saved PNG: {path}", "success")
 
@@ -3268,13 +4350,14 @@ class MainWindow(QMainWindow):
         if not self.state.line_cut_results:
             self._append_log("No line cuts available to save.", "warn")
             return
-        base = self._ensure_output_dir()
-        source = self.state.data["source_name"]
         saved = 0
         for lc in self.state.line_cut_results:
             cut_type = lc.get("cut_type", "cut")
             c_val = lc.get("c_value_used", 0.0)
-            path = os.path.join(base, f"{source}_{cut_type}_{c_val:+.4f}.csv")
+            sign = "n" if c_val < 0 else "p"
+            path = self._export_file_path(
+                f"linecut_{cut_type}_{sign}{abs(c_val):.4f}.csv"
+            )
             save_line_csv(lc, path)
             saved += 1
         self._append_log(f"Saved {saved} line-cut CSV(s).", "success")

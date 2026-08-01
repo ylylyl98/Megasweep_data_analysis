@@ -13,12 +13,13 @@ Megasweep PL Analysis is a Python desktop application and script workflow for an
 - Integrated PL intensity maps over a configurable energy window.
 - Automatic global baseline estimation for PL intensity maps.
 - Peak-energy maps using Savitzky-Golay smoothing.
-- Reflection mode with one or more background CSV files, averaged background spectra, RC spectra (`(I - I0) / I0`), RC peak-to-peak maps, and RC peak-position maps.
+- Reflection mode with one or more background CSV files, averaged background spectra, RC spectra (`(I - I0) / I0`), RC peak-to-peak maps, fixed-energy RC maps, and RC peak-position maps.
 - Coordinate transforms between raw gate axes and doping/efield axes using configurable lever-arm ratio and transform convention.
 - Interactive Matplotlib map previews with colormap and color-scale controls.
 - Constant-doping and constant-efield line-cut extraction.
 - Batch line-cut extraction with preview counts and output subfolders.
 - PNG and CSV exports for maps and line-cut results.
+- Per-dataset output routing under the full CSV-stem folder, with concise result filenames to avoid repeating the long measurement name.
 - Scriptable batch workflow in `megasweep_run.py`.
 
 ## Project Structure
@@ -114,7 +115,7 @@ Basic workflow:
 2. Choose a primary megasweep CSV file.
 3. Select the X/Y sweep-axis columns.
 4. Click `Load CSV`.
-5. Configure the energy window, baseline, ratio, transform convention, and Savitzky-Golay settings.
+5. Configure the six-decimal energy window, optional fixed RC energy, baseline, ratio, transform convention, and Savitzky-Golay settings.
 6. In Reflection mode, select one or more background CSV files and click `Load Background`.
 7. Use `Refresh Current View` or `Refresh All Maps` to generate map views.
 8. Configure line cuts and click `Extract Line Cuts`, or use batch extraction for all doping/efield cuts.
@@ -139,9 +140,13 @@ No environment variables or external config files were found.
 GUI settings are controlled through the application sidebar:
 
 - Mode: `PL` or `Reflection`
-- Input CSV and output directory
+- Input CSV and output base directory; each CSV writes to its full CSV-stem dataset folder
 - X/Y sweep-axis columns
 - Energy integration window
+- Fixed photon energy for interpolated `RC at Energy` maps
+- RC feature-position selection: automatic, local peak, or local dip
+- Measured `Ibias` maps on original or transformed axes
+- Resistance maps calculated as `R = Vbias / Ibias`, with measured Vbias preferred
 - PL baseline or automatic baseline estimation
 - Lever-arm ratio
 - Transform convention:
@@ -152,7 +157,13 @@ GUI settings are controlled through the application sidebar:
   - average all frames
   - average first frame per CSV
   - average last frame per CSV
+- Reflection-only `Raw / Background` tab overlays the selected unnormalized
+  raw spectrum and averaged background against their matched wavelength channels
+- Optional global background scaling estimated robustly from feature-free
+  energy windows on the left and right sides of the RC feature
 - Map type, axes, colormap, and optional color limits
+- Skipped sweep points render as masked full-size cells without interpolation
+- Fixed export-only inner map size: `3 × 3 in` at 300 DPI
 - Manual and batch line-cut settings
 
 Script settings in `megasweep_run.py` include:

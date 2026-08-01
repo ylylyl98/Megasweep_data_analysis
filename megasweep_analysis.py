@@ -12,7 +12,7 @@ Sections
 2.  Physics      – sum_select_region, compute_peak_energy, peak_filter
 3.  Grid         – build_grid
 4.  Maps         – compute_intensity_map, compute_peak_energy_map
-5.  Reflection   – compute_rc_spectra, compute_rc_peak_to_peak_map
+5.  Reflection   – compute_rc_spectra, fixed-energy and peak maps
 6.  Transforms   – compute_transformed_coords
 7.  Line cuts    – extract_line_cut
 8.  Plotting     – plot_map, plot_line_cut_spectrogram
@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+from matplotlib.font_manager import FontProperties
 from PIL import Image
 from scipy import optimize
 from scipy.signal import find_peaks, savgol_filter, medfilt2d
@@ -37,6 +38,37 @@ def _finite_min_max(values, label='values'):
     if finite.size == 0:
         raise ValueError(f"Cannot plot {label}: array contains no finite values.")
     return float(np.min(finite)), float(np.max(finite))
+
+
+def dataset_output_folder_name(csv_path: str) -> str:
+    """Return the full source CSV stem as its identifiable results folder."""
+    requested_csv = str(csv_path).strip()
+    if not requested_csv:
+        raise ValueError("A processed CSV path is required.")
+    csv_stem = os.path.splitext(os.path.basename(requested_csv))[0]
+    if not csv_stem:
+        raise ValueError("The processed CSV must have a valid filename.")
+    return f"{csv_stem}_outputs"
+
+
+def resolve_dataset_output_dir(base_dir: str, csv_path: str) -> str:
+    """Resolve the full-condition per-dataset output folder without nesting."""
+    requested_csv = str(csv_path).strip()
+    if not requested_csv:
+        raise ValueError("A processed CSV path is required.")
+    csv_path = os.path.abspath(os.path.expanduser(requested_csv))
+
+    requested_base = str(base_dir).strip()
+    if requested_base:
+        resolved_base = os.path.abspath(os.path.expanduser(requested_base))
+    else:
+        resolved_base = os.path.dirname(csv_path)
+
+    folder_name = dataset_output_folder_name(csv_path)
+    base_name = os.path.basename(os.path.normpath(resolved_base))
+    if os.path.normcase(base_name) == os.path.normcase(folder_name):
+        return resolved_base
+    return os.path.join(resolved_base, folder_name)
 
 
 def _resolve_color_limits(values, vmin=None, vmax=None):
@@ -103,6 +135,53 @@ def spectral_axes_match(left, right, atol=1e-3):
 def normalize_axis_name(name):
     """Normalize a column name for axis-role matching."""
     return ''.join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def find_ibias_column(columns) -> str | None:
+    """Return the most likely measured bias-current column, if present."""
+    preferred_names = {
+        "ibiasa": 0,
+        "ibiasmeas": 1,
+        "ibiasmeasured": 2,
+        "ibias": 3,
+        "biascurrenta": 4,
+        "biascurrent": 5,
+    }
+    candidates = []
+    for index, column in enumerate(columns):
+        normalized = normalize_axis_name(column)
+        if normalized in preferred_names:
+            candidates.append((preferred_names[normalized], index, column))
+        elif (
+            ("ibias" in normalized or "biascurrent" in normalized)
+            and "set" not in normalized
+        ):
+            candidates.append((10, index, column))
+    return str(min(candidates)[2]) if candidates else None
+
+
+def find_vbias_column(columns) -> str | None:
+    """Return the most likely measured bias-voltage column, if present."""
+    preferred_names = {
+        "vbiasmeas": 0,
+        "vbiasmeasured": 1,
+        "vbiasv": 2,
+        "vbias": 3,
+        "biasvoltagemeas": 4,
+        "biasvoltage": 5,
+    }
+    candidates = []
+    for index, column in enumerate(columns):
+        normalized = normalize_axis_name(column)
+        if normalized in preferred_names:
+            candidates.append((preferred_names[normalized], index, column))
+        elif (
+            ("vbias" in normalized or "biasvoltage" in normalized)
+            and "set" not in normalized
+            and "axis" not in normalized
+        ):
+            candidates.append((10, index, column))
+    return str(min(candidates)[2]) if candidates else None
 
 
 def classify_axis_role(name):
@@ -392,6 +471,32 @@ def load_megasweep_csv(csv_path, x_col=None, y_col=None):
     x_data = df[x_col].values.astype(float)
     y_data = df[y_col].values.astype(float)
     Intensity = df[spec_cols].values.astype(float)  # (matrix_size, n_wl)
+    ibias_name = find_ibias_column(metadata_cols)
+    ibias_data = None
+    if ibias_name is not None:
+        ibias_data = pd.to_numeric(df[ibias_name], errors="coerce").to_numpy(
+            dtype=float
+        )
+        if not np.any(np.isfinite(ibias_data)):
+            ibias_name = None
+            ibias_data = None
+
+    vbias_name = find_vbias_column(metadata_cols)
+    vbias_data = None
+    if vbias_name is not None:
+        vbias_data = pd.to_numeric(df[vbias_name], errors="coerce").to_numpy(
+            dtype=float
+        )
+        if not np.any(np.isfinite(vbias_data)):
+            vbias_name = None
+            vbias_data = None
+    if vbias_data is None:
+        if classify_axis_role(x_col) == "vbias":
+            vbias_name = x_col
+            vbias_data = x_data.copy()
+        elif classify_axis_role(y_col) == "vbias":
+            vbias_name = y_col
+            vbias_data = y_data.copy()
 
     source_name = os.path.splitext(os.path.basename(csv_path))[0]
 
@@ -405,6 +510,10 @@ def load_megasweep_csv(csv_path, x_col=None, y_col=None):
         'wavelength': wavelength,
         'energy': energy,
         'Intensity': Intensity,
+        'ibias_name': ibias_name,
+        'ibias_data': ibias_data,
+        'vbias_name': vbias_name,
+        'vbias_data': vbias_data,
         'raw_data': np.column_stack([x_data, y_data, Intensity]),
         'source_name': source_name,
         'source_path': os.path.abspath(csv_path),
@@ -657,8 +766,9 @@ def build_map_payload(x_data, y_data, quantity_flat):
     """
     Return a common map payload for both regular grids and irregular point clouds.
 
-    For regular data, X2D/Y2D/Z2D are 2-D arrays. For irregular data, they are
-    1-D sorted arrays suitable for scatter/triangulated plotting.
+    Complete grids and Cartesian grids with skipped coordinate pairs are
+    returned as 2-D arrays. Missing measurements remain NaN so they render as
+    empty cells without interpolating. Truly unstructured data remain 1-D.
     """
     x_vals = np.asarray(x_data, dtype=float).reshape(-1)
     y_vals = np.asarray(y_data, dtype=float).reshape(-1)
@@ -673,16 +783,43 @@ def build_map_payload(x_data, y_data, quantity_flat):
     n_x = len(np.unique(x_vals))
     n_y = len(np.unique(y_vals))
     pair_count = len({(float(x), float(y)) for x, y in zip(x_vals, y_vals)})
-    is_grid = bool(n_x * n_y == x_vals.size and pair_count == x_vals.size)
+    expected_count = n_x * n_y
+    measured_count = x_vals.size
+    is_complete_grid = bool(
+        expected_count == measured_count and pair_count == measured_count
+    )
+    occupancy = (
+        float(pair_count) / float(expected_count)
+        if expected_count
+        else 0.0
+    )
+    is_masked_grid = bool(
+        pair_count == measured_count
+        and measured_count > 0
+        and n_x > 1
+        and n_y > 1
+        and n_x < measured_count
+        and n_y < measured_count
+        and expected_count <= 2_000_000
+        and occupancy >= 0.10
+    )
+    is_grid = is_complete_grid or is_masked_grid
 
     if is_grid:
-        X2D = x_sorted.reshape(n_x, n_y)
-        Y2D = y_sorted.reshape(n_x, n_y)
-        Z2D = z_sorted.reshape(n_x, n_y)
+        x_unique = np.unique(x_vals)
+        y_unique = np.unique(y_vals)
+        X2D = np.repeat(x_unique[:, None], n_y, axis=1)
+        Y2D = np.repeat(y_unique[None, :], n_x, axis=0)
+        Z2D = np.full((n_x, n_y), np.nan, dtype=float)
+        x_indices = np.searchsorted(x_unique, x_vals)
+        y_indices = np.searchsorted(y_unique, y_vals)
+        Z2D[x_indices, y_indices] = z_vals
+        grid_kind = "complete" if is_complete_grid else "masked"
     else:
         X2D = x_sorted
         Y2D = y_sorted
         Z2D = z_sorted
+        grid_kind = "irregular"
 
     return {
         "flat": z_vals,
@@ -696,6 +833,12 @@ def build_map_payload(x_data, y_data, quantity_flat):
         "n_x": n_x,
         "n_y": n_y,
         "is_grid": is_grid,
+        "grid_kind": grid_kind,
+        "measured_count": int(measured_count),
+        "expected_count": int(expected_count if is_grid else measured_count),
+        "missing_count": int(
+            expected_count - pair_count if is_grid else 0
+        ),
     }
 
 
@@ -741,7 +884,65 @@ def compute_peak_energy_map(data, sg_window=31, sg_poly=3):
 # 5.  Reflection Mode (RC spectra and maps)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_rc_spectra(intensity: np.ndarray, background: np.ndarray) -> np.ndarray:
+def estimate_background_scale(
+    spectrum: np.ndarray,
+    background: np.ndarray,
+    energy: np.ndarray,
+    windows: list[tuple[float, float]],
+) -> tuple[float, dict]:
+    """Estimate one robust scale from combined feature-free energy windows."""
+    sample = np.asarray(spectrum, dtype=float).reshape(-1)
+    reference = np.asarray(background, dtype=float).reshape(-1)
+    energy_axis = np.asarray(energy, dtype=float).reshape(-1)
+    if sample.size != reference.size or sample.size != energy_axis.size:
+        raise ValueError(
+            "Spectrum, background, and energy must have the same channel count."
+        )
+    if not windows:
+        raise ValueError("At least one background-scale window is required.")
+
+    window_mask = np.zeros(energy_axis.shape, dtype=bool)
+    normalized_windows = []
+    for left, right in windows:
+        lo, hi = sorted((float(left), float(right)))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            raise ValueError(
+                "Each background-scale window must have finite min < max."
+            )
+        window_mask |= (energy_axis >= lo) & (energy_axis <= hi)
+        normalized_windows.append((lo, hi))
+
+    valid = (
+        window_mask
+        & np.isfinite(sample)
+        & np.isfinite(reference)
+        & np.isfinite(energy_axis)
+        & (np.abs(reference) >= 1e-12)
+    )
+    ratios = sample[valid] / reference[valid]
+    ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
+    if ratios.size < 3:
+        raise ValueError(
+            "The background-scale windows must contain at least three valid "
+            "positive sample/background channels."
+        )
+
+    scale = float(np.median(ratios))
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Estimated background scale must be finite and positive.")
+    median_absolute_deviation = float(np.median(np.abs(ratios - scale)))
+    return scale, {
+        "channel_count": int(ratios.size),
+        "relative_mad": float(median_absolute_deviation / scale),
+        "windows": normalized_windows,
+    }
+
+
+def compute_rc_spectra(
+    intensity: np.ndarray,
+    background: np.ndarray,
+    background_scale: float = 1.0,
+) -> np.ndarray:
     """
     Compute Reflectance Contrast spectra: RC = (I - I0) / I0.
 
@@ -754,7 +955,10 @@ def compute_rc_spectra(intensity: np.ndarray, background: np.ndarray) -> np.ndar
     -------
     (N, n_wl) array of RC values (can be negative)
     """
-    bg = np.asarray(background, dtype=float)
+    scale = float(background_scale)
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Background scale must be finite and positive.")
+    bg = np.asarray(background, dtype=float) * scale
     bg_safe = np.where(np.abs(bg) < 1e-12, np.nan, bg)
     return (np.asarray(intensity, dtype=float) - bg_safe) / bg_safe
 
@@ -777,11 +981,52 @@ def compute_rc_peak_to_peak_map(rc_spectra: np.ndarray, energy: np.ndarray,
     mask = (energy >= e_lo) & (energy <= e_hi)
     if not np.any(mask):
         raise ValueError(
-            f"No energy points in RC window [{e_lo:.3f}, {e_hi:.3f}] eV. "
-            f"Data energy range: [{float(energy.min()):.3f}, {float(energy.max()):.3f}] eV."
+            f"No energy points in RC window [{e_lo:.6f}, {e_hi:.6f}] eV. "
+            f"Data energy range: [{float(energy.min()):.6f}, {float(energy.max()):.6f}] eV."
         )
     window = rc_spectra[:, mask]
     return np.nanmax(window, axis=1) - np.nanmin(window, axis=1)
+
+
+def compute_rc_at_energy_map(
+    rc_spectra: np.ndarray,
+    energy: np.ndarray,
+    target_energy: float,
+) -> np.ndarray:
+    """Interpolate every RC spectrum at one fixed photon energy."""
+    energy_values = np.asarray(energy, dtype=float).reshape(-1)
+    rc_matrix = np.asarray(rc_spectra, dtype=float)
+    if rc_matrix.ndim != 2 or rc_matrix.shape[1] != energy_values.size:
+        raise ValueError(
+            "RC spectra must be a 2-D array whose columns match the energy axis."
+        )
+
+    finite_energy = np.isfinite(energy_values)
+    if np.count_nonzero(finite_energy) < 2:
+        raise ValueError("At least two finite energy channels are required.")
+
+    x = energy_values[finite_energy]
+    order = np.argsort(x)
+    x = x[order]
+    spectra = rc_matrix[:, finite_energy][:, order]
+    target = float(target_energy)
+    if not np.isfinite(target) or target < x[0] or target > x[-1]:
+        raise ValueError(
+            f"Fixed energy {target:.6f} eV is outside the data range "
+            f"[{x[0]:.6f}, {x[-1]:.6f}] eV."
+        )
+
+    right = int(np.searchsorted(x, target, side="left"))
+    if right == 0:
+        return spectra[:, 0].copy()
+    if right >= x.size:
+        return spectra[:, -1].copy()
+    if np.isclose(x[right], target, rtol=0.0, atol=1e-12):
+        return spectra[:, right].copy()
+
+    left = right - 1
+    fraction = (target - x[left]) / (x[right] - x[left])
+    return spectra[:, left] + fraction * (spectra[:, right] - spectra[:, left])
 
 
 def compute_rc_peak_position(
@@ -791,13 +1036,18 @@ def compute_rc_peak_position(
     e_hi: float,
     sg_window: int = 31,
     sg_poly: int = 3,
+    feature_mode: str = "auto",
 ) -> tuple[float, float]:
     """
     Find the dominant RC feature position within [e_lo, e_hi].
 
-    This follows the notebook workflow: search for a strong maximum first and,
-    if none is found, fall back to a strong minimum in the selected window.
+    ``feature_mode`` can be ``"peak"``, ``"dip"``, or ``"auto"``. Auto
+    follows the notebook workflow: search for a maximum first and use a
+    minimum only when no peak is found.
     """
+    feature_mode = str(feature_mode).strip().lower()
+    if feature_mode not in {"auto", "peak", "dip"}:
+        raise ValueError("feature_mode must be 'auto', 'peak', or 'dip'.")
     x = np.asarray(energy, dtype=float)
     y = np.asarray(rc_spectrum, dtype=float)
     finite_mask = np.isfinite(x) & np.isfinite(y)
@@ -849,13 +1099,17 @@ def compute_rc_peak_position(
                 return float(xw[nearest_index]), float(yw[nearest_index])
         return float(xw[candidate_index]), float(yw[candidate_index])
 
-    result = _best_feature(invert=False)
-    if result is not None:
-        return result
+    if feature_mode in {"auto", "peak"}:
+        result = _best_feature(invert=False)
+        if result is not None:
+            return result
+        if feature_mode == "peak":
+            return np.nan, np.nan
 
-    result = _best_feature(invert=True)
-    if result is not None:
-        return result
+    if feature_mode in {"auto", "dip"}:
+        result = _best_feature(invert=True)
+        if result is not None:
+            return result
 
     return np.nan, np.nan
 
@@ -867,6 +1121,7 @@ def compute_rc_peak_position_map(
     e_hi: float,
     sg_window: int = 31,
     sg_poly: int = 3,
+    feature_mode: str = "auto",
 ) -> np.ndarray:
     """Compute the dominant RC feature position for each sweep point."""
     rc_matrix = np.asarray(rc_spectra, dtype=float)
@@ -879,6 +1134,7 @@ def compute_rc_peak_position_map(
             e_hi,
             sg_window=sg_window,
             sg_poly=sg_poly,
+            feature_mode=feature_mode,
         )
     return positions
 
@@ -1202,6 +1458,8 @@ def plot_map(X2D, Y2D, Z2D,
     y_arr = np.asarray(Y2D, dtype=float)
     z_arr = np.asarray(Z2D, dtype=float)
     v0, v1, is_flat = _resolve_color_limits(z_arr, vmin=vmin, vmax=vmax)
+    map_cmap = plt.get_cmap(cmap).copy()
+    map_cmap.set_bad("#e5e7eb")
 
     if x_arr.ndim == 1 and y_arr.ndim == 1 and z_arr.ndim == 1:
         finite = np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(z_arr)
@@ -1213,7 +1471,7 @@ def plot_map(X2D, Y2D, Z2D,
             xf,
             yf,
             c=zf,
-            cmap=cmap,
+            cmap=map_cmap,
             vmin=v0,
             vmax=v1,
             marker='s',
@@ -1227,8 +1485,8 @@ def plot_map(X2D, Y2D, Z2D,
         artist = ax.pcolormesh(
             x_arr,
             y_arr,
-            z_arr,
-            cmap=cmap,
+            np.ma.masked_invalid(z_arr),
+            cmap=map_cmap,
             shading='nearest',
             vmin=v0,
             vmax=v1,
@@ -1241,8 +1499,8 @@ def plot_map(X2D, Y2D, Z2D,
         artist = ax.pcolormesh(
             x_arr,
             y_arr,
-            z_arr,
-            cmap=cmap,
+            np.ma.masked_invalid(z_arr),
+            cmap=map_cmap,
             shading='nearest',
             vmin=v0,
             vmax=v1,
@@ -1369,3 +1627,127 @@ def save_figure(fig, path: str, dpi: int = 300) -> None:
         return
 
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
+
+
+def save_figure_with_axes_size(
+    fig,
+    path: str,
+    axes_size: tuple[float, float],
+    dpi: int = 300,
+    axis=None,
+    title_fontsize: float = 12.0,
+    tick_fontsize: float = 10.0,
+    colorbar_width: float = 0.18,
+    colorbar_pad: float = 0.20,
+) -> None:
+    """Export a presentation-ready map, then restore the live GUI figure."""
+    if axis is None:
+        if not fig.axes:
+            raise ValueError("The figure has no plotting axes to size.")
+        axis = fig.axes[0]
+    if axis not in fig.axes:
+        raise ValueError("The selected plotting axes do not belong to this figure.")
+
+    axes_width, axes_height = (float(value) for value in axes_size)
+    if axes_width <= 0 or axes_height <= 0:
+        raise ValueError("Exported axes width and height must be positive.")
+
+    original_size = tuple(float(value) for value in fig.get_size_inches())
+    original_positions = {item: item.get_position().frozen() for item in fig.axes}
+    original_layout_engine = fig.get_layout_engine()
+    default_x_tick_size = FontProperties(
+        size=plt.rcParams["xtick.labelsize"]
+    ).get_size_in_points()
+    default_y_tick_size = FontProperties(
+        size=plt.rcParams["ytick.labelsize"]
+    ).get_size_in_points()
+    original_typography = {
+        item: {
+            "title": item.title.get_fontsize(),
+            "x_ticks": (
+                item.get_xticklabels()[0].get_fontsize()
+                if item.get_xticklabels()
+                else default_x_tick_size
+            ),
+            "y_ticks": (
+                item.get_yticklabels()[0].get_fontsize()
+                if item.get_yticklabels()
+                else default_y_tick_size
+            ),
+            "x_label": item.xaxis.label.get_fontsize(),
+            "y_label": item.yaxis.label.get_fontsize(),
+        }
+        for item in fig.axes
+    }
+    secondary_axes = [item for item in fig.axes if item is not axis]
+    original_secondary_layout = {
+        item: {
+            "box_aspect": item.get_box_aspect(),
+            "aspect": item.get_aspect(),
+            "anchor": item.get_anchor(),
+        }
+        for item in secondary_axes
+    }
+    main_position = original_positions[axis]
+    if main_position.width <= 0 or main_position.height <= 0:
+        raise ValueError("The plotting axes have an invalid layout size.")
+
+    export_size = (
+        axes_width / main_position.width,
+        axes_height / main_position.height,
+    )
+    try:
+        # Freeze the existing layout fractions while changing only the physical
+        # export canvas. The on-screen figure is restored in the finally block.
+        fig.set_layout_engine(None)
+        fig.set_size_inches(*export_size, forward=False)
+        for item, position in original_positions.items():
+            item.set_position(position)
+
+        axis.title.set_fontsize(title_fontsize)
+        axis.tick_params(axis="both", which="both", labelsize=tick_fontsize)
+
+        figure_width, _ = export_size
+        for colorbar_axis in secondary_axes:
+            colorbar_axis.set_box_aspect(None)
+            colorbar_axis.set_aspect("auto")
+            colorbar_axis.set_anchor("C")
+            colorbar_axis.set_position(
+                [
+                    main_position.x1 + colorbar_pad / figure_width,
+                    main_position.y0,
+                    colorbar_width / figure_width,
+                    main_position.height,
+                ]
+            )
+            colorbar_axis.tick_params(
+                axis="both",
+                which="both",
+                labelsize=tick_fontsize,
+            )
+            colorbar_axis.xaxis.label.set_fontsize(tick_fontsize)
+            colorbar_axis.yaxis.label.set_fontsize(tick_fontsize)
+        save_figure(fig, path, dpi=dpi)
+    finally:
+        fig.set_size_inches(*original_size, forward=False)
+        for item, position in original_positions.items():
+            item.set_position(position)
+        for item, typography in original_typography.items():
+            item.title.set_fontsize(typography["title"])
+            item.tick_params(
+                axis="x",
+                which="both",
+                labelsize=typography["x_ticks"],
+            )
+            item.tick_params(
+                axis="y",
+                which="both",
+                labelsize=typography["y_ticks"],
+            )
+            item.xaxis.label.set_fontsize(typography["x_label"])
+            item.yaxis.label.set_fontsize(typography["y_label"])
+        for item, layout in original_secondary_layout.items():
+            item.set_box_aspect(layout["box_aspect"])
+            item.set_aspect(layout["aspect"])
+            item.set_anchor(layout["anchor"])
+        fig.set_layout_engine(original_layout_engine)

@@ -6,9 +6,11 @@ import numpy as np
 import pandas as pd
 
 from megasweep_analysis import (
+    compute_rc_at_energy_map,
     compute_rc_peak_position,
     compute_rc_peak_to_peak_map,
     compute_rc_spectra,
+    estimate_background_scale,
     load_spectral_csv,
     spectral_axes_match,
 )
@@ -70,6 +72,28 @@ class ReflectionWorkflowTests(unittest.TestCase):
         rc = compute_rc_spectra(intensity, background)
         np.testing.assert_allclose(rc, [[0.2, -0.1], [-0.2, 0.5]])
 
+    def test_two_side_windows_recover_global_background_scale(self):
+        energy = np.array([1.50, 1.52, 1.54, 1.56, 1.58, 1.60, 1.62])
+        background = np.full(energy.shape, 100.0)
+        sample = np.array([60.0, 60.0, 60.0, 66.0, 60.0, 60.0, 60.0])
+
+        scale, info = estimate_background_scale(
+            sample,
+            background,
+            energy,
+            windows=[(1.50, 1.54), (1.58, 1.62)],
+        )
+        rc = compute_rc_spectra(
+            sample.reshape(1, -1),
+            background,
+            background_scale=scale,
+        )[0]
+
+        self.assertAlmostEqual(0.6, scale)
+        self.assertEqual(6, info["channel_count"])
+        np.testing.assert_allclose(rc[[0, 1, 2, 4, 5, 6]], 0.0)
+        self.assertAlmostEqual(0.1, rc[3])
+
     def test_peak_to_peak_uses_only_selected_energy_window(self):
         energy = np.array([1.0, 1.1, 1.2, 1.3])
         rc = np.array([
@@ -78,6 +102,25 @@ class ReflectionWorkflowTests(unittest.TestCase):
         ])
         values = compute_rc_peak_to_peak_map(rc, energy, 1.1, 1.2)
         np.testing.assert_allclose(values, [0.6, 1.0])
+
+    def test_fixed_energy_rc_map_interpolates_each_spectrum(self):
+        energy = np.array([1.0, 1.1, 1.2])
+        rc = np.array([
+            [0.0, 0.2, 0.6],
+            [1.0, 0.0, -1.0],
+        ])
+
+        values = compute_rc_at_energy_map(rc, energy, 1.15)
+
+        np.testing.assert_allclose(values, [0.4, -0.5])
+
+    def test_fixed_energy_rc_map_rejects_energy_outside_data(self):
+        with self.assertRaisesRegex(ValueError, "outside the data range"):
+            compute_rc_at_energy_map(
+                np.array([[0.1, 0.2]]),
+                np.array([1.0, 1.1]),
+                1.2,
+            )
 
     def test_peak_position_uses_only_selected_energy_window(self):
         energy = np.linspace(1.0, 2.0, 201)
@@ -94,6 +137,35 @@ class ReflectionWorkflowTests(unittest.TestCase):
             sg_poly=3,
         )
         self.assertAlmostEqual(1.35, peak_energy, places=2)
+
+    def test_peak_position_can_select_peak_or_dip(self):
+        energy = np.linspace(1.0, 2.0, 201)
+        spectrum = (
+            np.exp(-((energy - 1.30) / 0.03) ** 2)
+            - 2.0 * np.exp(-((energy - 1.70) / 0.03) ** 2)
+        )
+
+        peak_energy, _ = compute_rc_peak_position(
+            energy,
+            spectrum,
+            1.1,
+            1.9,
+            sg_window=11,
+            sg_poly=3,
+            feature_mode="peak",
+        )
+        dip_energy, _ = compute_rc_peak_position(
+            energy,
+            spectrum,
+            1.1,
+            1.9,
+            sg_window=11,
+            sg_poly=3,
+            feature_mode="dip",
+        )
+
+        self.assertAlmostEqual(1.30, peak_energy, places=2)
+        self.assertAlmostEqual(1.70, dip_energy, places=2)
 
     def test_reflection_map_worker_uses_rc_peak_to_peak_as_z(self):
         energy = np.array([1.0, 1.1, 1.2, 1.3, 1.4])
@@ -130,6 +202,49 @@ class ReflectionWorkflowTests(unittest.TestCase):
             [0.6, 1.0, 0.7, 1.2],
         )
         self.assertIn("peak_map_original", result)
+
+    def test_reflection_worker_builds_fixed_energy_rc_map(self):
+        energy = np.array([1.0, 1.1, 1.2])
+        background = np.full(3, 10.0)
+        rc = np.array([
+            [0.0, 0.2, 0.6],
+            [1.0, 0.0, -1.0],
+            [0.2, 0.4, 0.8],
+            [-0.2, -0.4, -0.8],
+        ])
+        data = {
+            "x_data": np.array([0.0, 0.0, 1.0, 1.0]),
+            "y_data": np.array([0.0, 1.0, 0.0, 1.0]),
+            "energy": energy,
+            "Intensity": 0.6 * background * (1.0 + rc),
+            "axis_space": "generic",
+        }
+
+        result = AnalysisRefreshWorker(
+            data,
+            min_energy=1.0,
+            max_energy=1.2,
+            baseline=0.0,
+            ratio=1.0,
+            sg_window=3,
+            sg_poly=1,
+            tasks=["fixed_original"],
+            tg_is_y=True,
+            mode="Reflection",
+            background_spectra=background,
+            fixed_energy=1.15,
+            background_scale=0.6,
+        ).process()
+
+        np.testing.assert_allclose(
+            result["fixed_map_original"]["flat"],
+            [0.4, -0.5, 0.6, -0.6],
+        )
+        self.assertEqual(1.15, result["fixed_map_original"]["fixed_energy"])
+        self.assertEqual(
+            0.6,
+            result["fixed_map_original"]["background_scale"],
+        )
 
 
 if __name__ == "__main__":
