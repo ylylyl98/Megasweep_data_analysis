@@ -110,13 +110,17 @@ if not exist "%VENV_PYTHONW%" (
 
 if exist "%SHORTCUT_SCRIPT%" if not exist "%APP_SHORTCUT%" (
     echo [SETUP] Creating Megasweep Analysis shortcut ...
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SHORTCUT_SCRIPT%" -AppRoot "%~dp0"
+    rem The script defaults AppRoot to its own directory, avoiding a quoted
+    rem argument ending in a backslash at the native PowerShell boundary.
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SHORTCUT_SCRIPT%"
     if errorlevel 1 (
         echo [WARNING] Shortcut creation failed. The application can still run.
     )
 )
 
 echo [RUN] Starting Megasweep PL Analysis ...
+rem START can preserve a previous command's failure code after succeeding.
+cmd /c exit 0
 start "" "%VENV_PYTHONW%" "%APP_ENTRY%"
 if errorlevel 1 (
     echo.

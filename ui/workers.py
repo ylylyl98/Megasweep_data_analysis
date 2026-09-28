@@ -169,22 +169,36 @@ class BackgroundLoadWorker(BaseWorker):
             wavelength = np.asarray(data["wavelength"], dtype=float)
             energy = np.asarray(data["energy"], dtype=float)
 
+            expected = self.expected_wavelength if reference_wavelength is None else reference_wavelength
+            if expected is not None:
+                expected = np.asarray(expected, dtype=float).reshape(-1)
+                if not spectral_axes_match(wavelength, expected):
+                    detail = f"Background has {wavelength.size} channels; reference has {expected.size}."
+                    if wavelength.shape == expected.shape and wavelength.size:
+                        if np.all(np.isfinite(wavelength)) and np.all(np.isfinite(expected)):
+                            delta = np.abs(wavelength - expected)
+                            index = int(np.argmax(delta))
+                            detail += (
+                                f" Maximum difference {delta[index]:.7g} nm at channel {index + 1}:"
+                                f" background={wavelength[index]:.9g}, reference={expected[index]:.9g} nm."
+                            )
+                        else:
+                            detail += " Non-finite wavelength values found."
+                    raise ValueError(
+                        f"Background spectral channels do not match: {csv_path}. {detail} "
+                        "Allowed difference: 0.001 nm, or six-significant-digit header rounding "
+                        "(channel-dependent, at most 0.0051 nm). Channel order must match."
+                    )
+                if not np.allclose(wavelength, expected, rtol=0, atol=0.001):
+                    self.log.emit(
+                        f"{os.path.basename(csv_path)}: matched header rounding differences "
+                        f"(maximum {np.max(np.abs(wavelength - expected)):.7g} nm); "
+                        "using corresponding channels without interpolation."
+                    )
+
             if reference_wavelength is None:
                 reference_wavelength = wavelength
                 reference_energy = energy
-                if self.expected_wavelength is not None:
-                    if not spectral_axes_match(wavelength, self.expected_wavelength):
-                        raise ValueError(
-                            "Background spectral channels do not match the loaded megasweep data. "
-                            f"Background has {wavelength.size} channels spanning "
-                            f"{wavelength.min():.4f}-{wavelength.max():.4f} nm; primary data has "
-                            f"{self.expected_wavelength.size} channels spanning "
-                            f"{self.expected_wavelength.min():.4f}-{self.expected_wavelength.max():.4f} nm."
-                        )
-            elif not spectral_axes_match(wavelength, reference_wavelength):
-                raise ValueError(
-                    "Selected background CSV files do not share the same spectral channels."
-                )
 
             frames = self._select_background_frames(np.asarray(data["Intensity"], dtype=float))
             if frames.ndim != 2 or frames.shape[0] == 0:
@@ -230,6 +244,7 @@ class AnalysisRefreshWorker(BaseWorker):
         fixed_energy: float | None = None,
         background_scale: float = 1.0,
         rc_feature_mode: str = "auto",
+        peak_cache: dict | None = None,
     ):
         super().__init__()
         self.data = data
@@ -247,6 +262,7 @@ class AnalysisRefreshWorker(BaseWorker):
         self.fixed_energy = fixed_energy
         self.background_scale = background_scale
         self.rc_feature_mode = rc_feature_mode
+        self.peak_cache = peak_cache if peak_cache is not None else {}
 
     def process(self) -> dict:
         tasks = set(self.tasks)
@@ -510,7 +526,22 @@ class AnalysisRefreshWorker(BaseWorker):
                 payload["fixed_map_transformed"] = fixed_transformed
 
         if {"peak_original", "peak_transformed"} & tasks:
+            peak_parameters = (self.mode, self.sg_window, self.sg_poly)
+            reference = None
             if self.mode == "Reflection":
+                reference = self.background_spectra
+                peak_parameters += (self.min_energy, self.max_energy,
+                                    self.background_scale, self.rc_feature_mode)
+            cache_hit = (
+                self.peak_cache.get("data") is self.data
+                and self.peak_cache.get("background") is reference
+                and self.peak_cache.get("parameters") == peak_parameters
+                and "values" in self.peak_cache
+            )
+            if cache_hit:
+                self.log.emit("Reusing cached spectral peak positions; rebuilding map coordinates...")
+                peak_flat = self.peak_cache["values"]
+            elif self.mode == "Reflection":
                 self.log.emit("Computing RC peak-position map...")
                 peak_flat = compute_rc_peak_position_map(
                     working_intensity,
@@ -524,6 +555,10 @@ class AnalysisRefreshWorker(BaseWorker):
             else:
                 self.log.emit("Computing peak-energy map...")
                 peak_flat = compute_peak_energy(working_intensity, self.data['energy'], self.sg_window, self.sg_poly)
+            if not cache_hit:
+                self.peak_cache.clear()
+                self.peak_cache.update(data=self.data, background=reference,
+                                       parameters=peak_parameters, values=peak_flat)
             if "peak_original" in tasks:
                 peak_original = build_map_payload(
                     self.data["x_data"],

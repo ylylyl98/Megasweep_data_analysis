@@ -18,6 +18,46 @@ from ui.workers import AnalysisRefreshWorker, BackgroundLoadWorker
 
 
 class ReflectionWorkflowTests(unittest.TestCase):
+    def test_six_significant_digit_headers_match_without_resampling(self):
+        precise = np.array([1157.2487, 1047.8650, 999.0455, 899.2866])
+        rounded = np.array([1157.25, 1047.86, 999.046, 899.287])
+        self.assertTrue(spectral_axes_match(precise, rounded))
+        self.assertTrue(spectral_axes_match(rounded, precise))
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "rounded_background.csv")
+            pd.DataFrame([[10, 20, 30, 40]], columns=precise.astype(str)).to_csv(path, index=False)
+            worker = BackgroundLoadWorker([path], expected_wavelength=rounded)
+            logs = []
+            worker.log.connect(logs.append)
+            result = worker.process()
+        np.testing.assert_array_equal(result["background_spectra"], [10, 20, 30, 40])
+        self.assertTrue(any("rounding" in message for message in logs))
+
+    def test_rounding_does_not_accept_shift_reordering_or_invalid_axes(self):
+        precise = np.array([1157.2487, 1047.8650, 999.0455, 899.2866])
+        rounded = np.array([1157.25, 1047.86, 999.046, 899.287])
+        for other in (rounded + .02, rounded[::-1], rounded[:-1],
+                      [np.inf] * 4, [np.nan] * 4):
+            self.assertFalse(spectral_axes_match(precise, other))
+        self.assertFalse(spectral_axes_match([1157.2487, 1156.7482], [1157.2527, 1156.7522]))
+        self.assertFalse(spectral_axes_match([np.inf], [np.inf]))
+
+    def test_rounding_at_power_of_ten_uses_finer_lower_interval(self):
+        self.assertFalse(spectral_axes_match([1000.0, 1001.23], [999.996, 1001.234]))
+        self.assertTrue(spectral_axes_match([1000.0, 1001.23], [999.9995, 1001.234]))
+
+    def test_background_mismatch_reports_file_channel_and_difference(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "wrong_background.csv")
+            pd.DataFrame([[10, 20]], columns=["1157.2487", "1156.7482"]).to_csv(path, index=False)
+            worker = BackgroundLoadWorker([path], expected_wavelength=np.array([1157.25, 1156.80]))
+            with self.assertRaises(ValueError) as raised:
+                worker.process()
+        message = str(raised.exception)
+        self.assertIn("wrong_background.csv", message)
+        self.assertIn("channel 2", message)
+        self.assertIn("0.0518", message)
+
     def test_background_loader_ignores_primary_sweep_metadata(self):
         frame = pd.DataFrame({
             "Vbg_set": [0.0, 0.0],

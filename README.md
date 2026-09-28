@@ -20,7 +20,40 @@ Megasweep PL Analysis is a Python desktop application and script workflow for an
 - Batch line-cut extraction with preview counts and output subfolders.
 - PNG and CSV exports for maps and line-cut results.
 - Per-dataset output routing under the full CSV-stem folder, with concise result filenames to avoid repeating the long measurement name.
+- Per-CSV analysis memory: parameters, background files, and previously generated views are saved locally and restored when that CSV is loaded again.
 - Scriptable batch workflow in `megasweep_run.py`.
+
+## Remembering an analysis
+
+Map controls are grouped into view/refresh, color scale, and X/Y range rows;
+groups wrap when the window is narrow. Each axis has an independent Auto toggle
+and manual Min/Max. Range changes only adjust the view (Min must be below Max),
+and Original/Transformed views remember separate ranges for each CSV. PNG export
+uses the visible range; CSV export keeps the complete measured data. Colormap
+and color-scale edits update the current plot immediately without recalculation.
+
+Map refreshes reuse valid numerical results when only display settings change.
+Peak positions are also reused when changing the coordinate transform or ratio;
+only the map grid is rebuilt. Changes to the data, reference spectrum, or relevant
+peak-analysis parameters invalidate the cached result. These numerical caches
+last for the current process; reopening a saved analysis recalculates its views.
+
+After loading a CSV, changes to analysis settings are saved automatically (also
+when switching datasets or closing the app). Loading the same CSV restores its
+PL/Reflection mode, X/Y columns, background files and averaging mode, energy and
+background-scale windows, smoothing, coordinate transform, map colors/limits,
+preview coordinates, and line-cut specifications. Previously generated maps,
+RC previews, and individual line cuts are recalculated automatically after the
+background has been loaded and validated. Exports and batch export operations
+are not repeated.
+
+Each absolute CSV path has its own configuration. On Windows the JSON files
+live in `%LOCALAPPDATA%\MegasweepAnalysis\sessions`; the source CSVs are never
+modified. Renaming or moving a CSV starts a separate configuration. Missing or
+incompatible backgrounds stop automatic reconstruction with a message in the
+Log; the saved parameters remain available. Settings from sessions before this
+feature was installed cannot be recovered: configure the dataset once after
+restarting the updated app.
 
 ## Project Structure
 

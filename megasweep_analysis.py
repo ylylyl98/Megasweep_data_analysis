@@ -123,13 +123,37 @@ def _split_numeric_spectral_columns(columns, excluded=None):
 
 
 def spectral_axes_match(left, right, atol=1e-3):
-    """Return whether two wavelength axes represent the same detector channels."""
+    """Match ordered channels, including six-significant-digit CSV exports.
+
+    Keep the usual absolute tolerance. The additional rounding allowance only
+    applies when a whole axis lies on the six-significant-digit export grid.
+    Allow half a four-decimal-place unit for the reference's own rounding;
+    never widen the per-channel tolerance beyond 0.0051 nm for this format.
+    No sorting, interpolation, or modification of either axis is performed.
+    """
     left_array = np.asarray(left, dtype=float).reshape(-1)
     right_array = np.asarray(right, dtype=float).reshape(-1)
-    return bool(
-        left_array.shape == right_array.shape
-        and np.allclose(left_array, right_array, rtol=0.0, atol=float(atol))
-    )
+    if (left_array.shape != right_array.shape or not left_array.size
+            or not np.all(np.isfinite(left_array))
+            or not np.all(np.isfinite(right_array))):
+        return False
+    difference = np.abs(left_array - right_array)
+    if np.all(difference <= float(atol)):
+        return True
+    for exported, reference in ((left_array, right_array), (right_array, left_array)):
+        if np.any(exported <= 0) or np.any(reference <= 0):
+            continue
+        step = 10.0 ** (np.floor(np.log10(exported)) - 5)
+        quantized = np.round(exported / step) * step
+        if not np.allclose(exported, quantized, rtol=0, atol=1e-9):
+            continue
+        # A value just below 1000 nm has a finer rounding interval even if
+        # its rounded representation crosses the boundary to 1000.
+        interval_step = 10.0 ** (np.floor(np.log10(np.minimum(exported, reference))) - 5)
+        rounding_tolerance = np.minimum(interval_step / 2 + 0.00005 + 1e-9, 0.0051)
+        if np.all(difference <= np.maximum(float(atol), rounding_tolerance)):
+            return True
+    return False
 
 
 def normalize_axis_name(name):

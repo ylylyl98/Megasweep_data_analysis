@@ -10,7 +10,7 @@ import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -59,6 +59,8 @@ from megasweep_analysis import (
     validate_axis_selection,
 )
 from ui.app_state import AppState
+from ui.session_memory import SessionMemoryMixin
+from ui.map_display import MapDisplayMixin, WrapLayout
 from ui.workers import (
     AnalysisRefreshWorker,
     BackgroundLoadWorker,
@@ -547,7 +549,7 @@ class CsvDropLineEdit(QLineEdit):
         event.acceptProposedAction()
 
 
-class MainWindow(QMainWindow):
+class MainWindow(MapDisplayMixin, SessionMemoryMixin, QMainWindow):
     _EXPORT_MAP_AXES_SIZE = (3.0, 3.0)
     _LOG_COLORS = {
         "info": "#334155",
@@ -556,7 +558,7 @@ class MainWindow(QMainWindow):
         "warn": "#b45309",
     }
 
-    def __init__(self):
+    def __init__(self, *, session_directory=None):
         super().__init__()
         self.setWindowTitle("Megasweep PL Analysis")
         self.setMinimumSize(1280, 760)
@@ -565,7 +567,10 @@ class MainWindow(QMainWindow):
         self.state = AppState()
         self._thread: QThread | None = None
         self._worker = None
+        self._worker_success_callback = None
         self._pending_context = ""
+        self._map_cache_signatures = {}
+        self._spectral_peak_cache = {}
         self._building_combos = False
         self._intensity_range_user_modified = False
         self._intensity_defaults_csv_signature: tuple[str, float, float, int] | None = None
@@ -592,6 +597,8 @@ class MainWindow(QMainWindow):
         }
 
         self._setup_ui()
+        self._setup_map_display()
+        self._setup_session_memory(session_directory)
         self.setAcceptDrops(True)
         self._refresh_stage_states()
 
@@ -763,24 +770,21 @@ class MainWindow(QMainWindow):
         map_controls_layout = QVBoxLayout(map_controls)
         map_controls_layout.setContentsMargins(12, 10, 12, 10)
         map_controls_layout.setSpacing(8)
-        map_row = QHBoxLayout()
+        map_row = WrapLayout()
         map_row.setContentsMargins(0, 0, 0, 0)
         map_row.setSpacing(8)
-        map_row.addWidget(QLabel("Map Type"))
         self.map_type_combo = QComboBox()
         self.map_type_combo.addItems(
             ["Intensity", "Peak Energy", "Ibias", "Resistance"]
         )
         self.map_type_combo.setFixedWidth(145)
         self.map_type_combo.currentTextChanged.connect(self._on_map_selection_changed)
-        map_row.addWidget(self.map_type_combo)
-        map_row.addWidget(QLabel("Axes:"))
+        map_row.addWidget(self._hrow(QLabel("Map Type"), self.map_type_combo))
         self.map_axes_combo = QComboBox()
         self.map_axes_combo.addItems(["Original", "Transformed"])
         self.map_axes_combo.setFixedWidth(90)
         self.map_axes_combo.currentTextChanged.connect(self._on_map_selection_changed)
-        map_row.addWidget(self.map_axes_combo)
-        map_row.addWidget(QLabel("Cmap:"))
+        map_row.addWidget(self._hrow(QLabel("Axes"), self.map_axes_combo))
         self.map_cmap_combo = QComboBox()
         self.map_cmap_combo.addItems([
             "RdBu_r", "jet", "viridis", "plasma", "inferno",
@@ -788,37 +792,28 @@ class MainWindow(QMainWindow):
         ])
         self.map_cmap_combo.setCurrentText("RdBu_r")
         self.map_cmap_combo.setFixedWidth(90)
-        map_row.addWidget(self.map_cmap_combo)
-        map_row.addStretch()
-        self.refresh_current_btn = QPushButton("Refresh Current View")
+        self.refresh_current_btn = QPushButton("Refresh Current")
         self.refresh_current_btn.setProperty("class", "primary")
         self.refresh_current_btn.clicked.connect(self._refresh_current_map_view)
         self.refresh_current_btn.style().unpolish(self.refresh_current_btn)
         self.refresh_current_btn.style().polish(self.refresh_current_btn)
         self.refresh_all_maps_btn = QPushButton("Refresh All Maps")
         self.refresh_all_maps_btn.clicked.connect(self._refresh_all_maps)
+        map_row.addWidget(self._hrow(self.refresh_current_btn, self.refresh_all_maps_btn))
         map_controls_layout.addLayout(map_row)
 
-        map_actions_row = QHBoxLayout()
-        map_actions_row.setContentsMargins(0, 0, 0, 0)
-        map_actions_row.setSpacing(8)
-        map_actions_row.addStretch()
-        map_actions_row.addWidget(self.refresh_current_btn)
-        map_actions_row.addWidget(self.refresh_all_maps_btn)
-        map_controls_layout.addLayout(map_actions_row)
-
         # ── Color scale row ───────────────────────────────────────────────
-        scale_row = QHBoxLayout()
+        scale_row = WrapLayout()
         scale_row.setContentsMargins(0, 0, 0, 0)
         scale_row.setSpacing(4)
         self.map_auto_scale_check = QCheckBox("Auto scale")
         self.map_auto_scale_check.setChecked(True)
         self.map_vmin_spin = self._dspin(-1e6, 1e6, 0.001, 4, 0.0)
         self.map_vmin_spin.setEnabled(False)
-        self.map_vmin_spin.setFixedWidth(80)
+        self.map_vmin_spin.setFixedWidth(96)
         self.map_vmax_spin = self._dspin(-1e6, 1e6, 0.001, 4, 1.0)
         self.map_vmax_spin.setEnabled(False)
-        self.map_vmax_spin.setFixedWidth(80)
+        self.map_vmax_spin.setFixedWidth(96)
         self.map_auto_scale_check.toggled.connect(
             lambda checked: (
                 self.map_vmin_spin.setEnabled(not checked),
@@ -826,14 +821,14 @@ class MainWindow(QMainWindow):
                 self._sync_color_limit_controls() if checked else None,
             )
         )
-        scale_row.addWidget(self.map_auto_scale_check)
-        scale_row.addWidget(QLabel("vmin"))
-        scale_row.addWidget(self.map_vmin_spin)
-        scale_row.addSpacing(8)
-        scale_row.addWidget(QLabel("vmax"))
-        scale_row.addWidget(self.map_vmax_spin)
-        scale_row.addStretch()
+        scale_row.addWidget(self._hrow(QLabel("Colormap"), self.map_cmap_combo))
+        scale_row.addWidget(self._hrow(self.map_auto_scale_check, QLabel("Min"),
+                                      self.map_vmin_spin, QLabel("Max"), self.map_vmax_spin))
         map_controls_layout.addLayout(scale_row)
+        ranges_row = WrapLayout()
+        ranges_row.addWidget(self._build_axis_range_group("x"))
+        ranges_row.addWidget(self._build_axis_range_group("y"))
+        map_controls_layout.addLayout(ranges_row)
         # ─────────────────────────────────────────────────────────────────
 
         self.map_status_label = QLabel("Load a CSV, choose settings, then refresh a map view.")
@@ -945,6 +940,10 @@ class MainWindow(QMainWindow):
             "Select a CSV to determine its results subfolder."
         )
         self.active_output_label.setWordWrap(True)
+        # Unbroken measurement paths must not set the scroll area's minimum width.
+        self.active_output_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.active_output_label.setMinimumWidth(0)
+        self.active_output_label.setTextFormat(Qt.PlainText)
         self.active_output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.active_output_label.setStyleSheet("color:#5a7088; font-size:9px;")
         form.addRow("Saves to:", self.active_output_label)
@@ -978,6 +977,9 @@ class MainWindow(QMainWindow):
 
         self.summary_label = QLabel("No CSV loaded.")
         self.summary_label.setWordWrap(True)
+        self.summary_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.summary_label.setMinimumWidth(0)
+        self.summary_label.setTextFormat(Qt.PlainText)
         self.summary_label.setStyleSheet("color:#5a7088;")
         form.addRow("Summary:", self.summary_label)
         return group
@@ -1017,6 +1019,9 @@ class MainWindow(QMainWindow):
         
         self.bg_status_label = QLabel("No background loaded.")
         self.bg_status_label.setWordWrap(True)
+        self.bg_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.bg_status_label.setMinimumWidth(0)
+        self.bg_status_label.setTextFormat(Qt.PlainText)
         self.bg_status_label.setStyleSheet("color:#5a7088;")
         form.addRow("Status:", self.bg_status_label)
         
@@ -1593,8 +1598,12 @@ class MainWindow(QMainWindow):
         if figure is None:
             self.map_plot_tab.clear()
         else:
+            if hasattr(self, "_axis_ranges"):
+                self._apply_axis_ranges(figure, self.map_axes_combo.currentText())
             self.map_plot_tab.set_figure(figure)
         self._sync_color_limit_controls()
+        self._sync_axis_range_controls()
+        self._update_map_colors()
         self._update_status_labels()
 
     def _on_map_selection_changed(self, _value: str) -> None:
@@ -1724,7 +1733,72 @@ class MainWindow(QMainWindow):
                 tasks.append("fixed_transformed")
         self._start_analysis_refresh(tasks, "Refreshing all map views")
 
+    _MAP_CACHE_FIELDS = {
+        "intensity_original": ("original_map", "original_map"),
+        "intensity_transformed": ("transformed_map", "transformed_map"),
+        "peak_original": ("peak_map_original", "peak_map_original"),
+        "peak_transformed": ("peak_map_transformed", "peak_map_transformed"),
+        "fixed_original": ("rc_fixed_map_original", "fixed_map_original"),
+        "fixed_transformed": ("rc_fixed_map_transformed", "fixed_map_transformed"),
+        "ibias_original": ("ibias_map_original", "ibias_map_original"),
+        "ibias_transformed": ("ibias_map_transformed", "ibias_map_transformed"),
+        "resistance_original": ("resistance_map_original", "resistance_map_original"),
+        "resistance_transformed": ("resistance_map_transformed", "resistance_map_transformed"),
+    }
+
+    def _map_calculation_signature(self, task):
+        signature = [id(self.state.data)]
+        kind, axes = task.rsplit("_", 1)
+        if axes == "transformed":
+            signature.extend((self.ratio_spin.value(), self._current_convention()))
+        if kind not in {"ibias", "resistance"}:
+            signature.append(self.state.mode)
+            if self.state.mode == "Reflection":
+                scale = self.state.background_scale_factor if self.background_scale_check.isChecked() else 1.0
+                signature.extend((id(self.state.background_spectra), scale))
+            if kind == "intensity" or (kind == "peak" and self.state.mode == "Reflection"):
+                signature.extend((self.int_min_spin.value(), self.int_max_spin.value()))
+            if kind == "intensity" and self.state.mode == "PL":
+                signature.append(self.baseline_spin.value())
+            if kind == "peak":
+                signature.extend((self.sg_window_spin.value(), self.sg_poly_spin.value()))
+                if self.state.mode == "Reflection":
+                    signature.append(self._current_rc_feature_mode())
+            if kind == "fixed":
+                signature.append(self.fixed_energy_spin.value())
+        return tuple(signature)
+
     def _start_analysis_refresh(self, tasks: list[str], context: str) -> None:
+        if self._thread is not None:
+            self._append_log("An analysis task is already running. Please wait for it to finish.", "warn")
+            return
+        signatures = {task: self._map_calculation_signature(task) for task in tasks}
+        cached, missing = {}, []
+        for task in tasks:
+            attribute, payload_key = self._MAP_CACHE_FIELDS[task]
+            result = getattr(self.state, attribute)
+            if (result is not None and not self._dirty_views.get(task, True)
+                    and self._map_cache_signatures.get(task) == signatures[task]):
+                cached[payload_key] = result
+            else:
+                missing.append(task)
+        if cached:
+            self._append_log(f"Reusing {len(cached)} cached map(s); updating display settings.", "info")
+        if not missing:
+            self._on_analysis_refresh_ready(cached)
+            self._schedule_session_save()
+            return
+
+        def on_ready(payload):
+            self._on_analysis_refresh_ready({**cached, **payload})
+            for task in tasks:
+                attribute, payload_key = self._MAP_CACHE_FIELDS[task]
+                if payload_key in payload or payload_key in cached:
+                    self._map_cache_signatures[task] = signatures[task]
+                    # Controls can change while the worker runs. Never label an
+                    # old calculation as valid for those newly selected values.
+                    self._dirty_views[task] = signatures[task] != self._map_calculation_signature(task)
+
         worker = AnalysisRefreshWorker(
             self.state.data,
             self.int_min_spin.value(),
@@ -1733,7 +1807,7 @@ class MainWindow(QMainWindow):
             self.ratio_spin.value(),
             self.sg_window_spin.value(),
             self.sg_poly_spin.value(),
-            tasks,
+            missing,
             tg_is_y=True,
             mode=self.state.mode,
             background_spectra=self.state.background_spectra,
@@ -1745,8 +1819,9 @@ class MainWindow(QMainWindow):
                 else 1.0
             ),
             rc_feature_mode=self._current_rc_feature_mode(),
+            peak_cache=self._spectral_peak_cache,
         )
-        self._run_worker(worker, self._on_analysis_refresh_ready, context=context)
+        self._run_worker(worker, on_ready, context=context)
 
     def _export_map_axes_size(self) -> tuple[float, float]:
         return self._EXPORT_MAP_AXES_SIZE
@@ -1967,6 +2042,9 @@ class MainWindow(QMainWindow):
             self.peak_plot_tabs.setCurrentWidget(self.peak_original_plot_tab)
 
     def _on_csv_path_changed(self) -> None:
+        if self._thread is not None:
+            self._append_log("Wait for the current task before changing CSV files.", "warn")
+            return
         path = self.csv_edit.text().strip()
         self.csv_edit.setToolTip(path)
         if not path or not os.path.isfile(path):
@@ -1979,6 +2057,8 @@ class MainWindow(QMainWindow):
             self._refresh_stage_states()
             return
 
+        session_changed = self._select_session(path)
+        previous_axes = self._capture_controls()
         gate_columns = self._extract_gate_columns(columns)
         y_guess, x_guess = self._guess_gate_columns(gate_columns)
 
@@ -1992,6 +2072,10 @@ class MainWindow(QMainWindow):
         if y_guess:
             self.vtg_combo.setCurrentText(y_guess)
         self._building_combos = False
+        if session_changed:
+            self._prepare_session_headers()
+        else:
+            self._apply_session_controls(previous_axes, ("vbg_combo", "vtg_combo"))
         self._update_axis_ui_text()
 
         self.state.header_columns = columns
@@ -2736,6 +2820,7 @@ class MainWindow(QMainWindow):
             "Drag horizontally to change the window."
         )
         self.reflection_preview_status_label.setText(self._reflection_preview_message)
+        self._schedule_session_save()
 
     def _on_intensity_settings_changed(self) -> None:
         if self.state.data is None:
@@ -3001,6 +3086,7 @@ class MainWindow(QMainWindow):
             self._on_linecut_settings_changed()
 
     def _on_linecut_type_changed(self, combo: QComboBox) -> None:
+        self._schedule_session_save()
         for row in range(self.cuts_table.rowCount()):
             if self.cuts_table.cellWidget(row, 0) is combo:
                 self._snap_linecut_row_value(row)
@@ -3118,6 +3204,9 @@ class MainWindow(QMainWindow):
         self._on_linecut_settings_changed()
 
     def _start_csv_load(self) -> None:
+        if self._thread is not None:
+            return
+        self._save_session()
         csv_path = self.csv_edit.text().strip()
         if not csv_path or not os.path.isfile(csv_path):
             self._append_log("Select a valid CSV file first.", "error")
@@ -3372,12 +3461,15 @@ class MainWindow(QMainWindow):
 
         self._thread = QThread(self)
         self._worker = worker
+        self._worker_success_callback = on_success
         worker.moveToThread(self._thread)
 
         self._thread.started.connect(worker.run)
         worker.log.connect(self._log_worker_message)
         worker.progress.connect(self._on_worker_progress)
-        worker.finished.connect(on_success)
+        # Plain Python callbacks/closures may run in the emitting worker thread.
+        # Deliver every result through a QObject slot owned by the GUI thread.
+        worker.finished.connect(self._dispatch_worker_result, Qt.QueuedConnection)
         worker.finished.connect(self._on_worker_finished)
         worker.error.connect(self._on_worker_error)
         worker.finished.connect(self._thread.quit)
@@ -3385,6 +3477,14 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._cleanup_worker)
         self._thread.start()
         self._append_log(context, "info")
+
+    @Slot(object)
+    def _dispatch_worker_result(self, result) -> None:
+        try:
+            if self._worker_success_callback is not None:
+                self._worker_success_callback(result)
+        except Exception:
+            self._on_worker_error(traceback.format_exc())
 
     def _log_worker_message(self, message: str) -> None:
         self._append_log(message, "info")
@@ -3404,6 +3504,9 @@ class MainWindow(QMainWindow):
             self._thread.deleteLater()
         self._thread = None
         self._worker = None
+        self._worker_success_callback = None
+        self._advance_session_restore()
+        self._schedule_session_save()
 
     def _on_worker_finished(self, _result) -> None:
         try:
@@ -3416,6 +3519,8 @@ class MainWindow(QMainWindow):
             self._append_log(traceback.format_exc(), "error")
 
     def _on_worker_error(self, tb: str) -> None:
+        self._restore_steps = []
+        self._restoring_session = False
         try:
             self._append_log(tb, "error")
             self._set_controls_enabled(True)
@@ -3531,6 +3636,8 @@ class MainWindow(QMainWindow):
     def _on_csv_loaded(self, result: dict) -> None:
         try:
             data = result["data"]
+            self._map_cache_signatures.clear()
+            self._spectral_peak_cache.clear()
             self.state.data = data
             self.state.csv_path = data.get("source_path", self.state.csv_path)
             
@@ -3626,6 +3733,7 @@ class MainWindow(QMainWindow):
                     f" | Axes: X={data.get('x_name', 'X')}, Y={data.get('y_name', 'Y')}"
                 )
             self.summary_label.setText(summary_text)
+            self.summary_label.setToolTip(summary_text)
             known_axis_modes = {"raw_gate", "transformed", "doping_bias", "generic_sweep"}
             self._append_log(
                 axis_status["message"],
@@ -3674,6 +3782,7 @@ class MainWindow(QMainWindow):
             else:
                 self.analysis_section.set_expanded(True)
                 self.sidebar_scroll.ensureWidgetVisible(self.analysis_section, 0, 16)
+            self._restore_session_loaded()
         except Exception:
             self._append_log(traceback.format_exc(), "error")
 
@@ -3851,6 +3960,7 @@ class MainWindow(QMainWindow):
                         vmax=vmax_val,
                     )
                     self.state.figures[figure_key] = fig
+                    self._apply_axis_ranges(fig, "Original" if target_axes == "original" else "Transformed")
                     self._log_map_payload(z_name, map_data, x_name, y_name)
 
                 except Exception:
@@ -3906,6 +4016,7 @@ class MainWindow(QMainWindow):
                 f"Background: {n_channels} ch, averaged from {n_spectra} spectra. "
                 f"({os.path.basename(self.state.background_path)})"
             )
+            self.bg_status_label.setToolTip("\n".join(self.state.background_paths))
             self._append_log(
                 f"Background loaded: {n_channels} channels, {n_spectra} spectra averaged.",
                 "success",
@@ -3937,6 +4048,9 @@ class MainWindow(QMainWindow):
     # ── Mode switching ────────────────────────────────────────────────────
 
     def _on_mode_changed(self, mode: str) -> None:
+        if hasattr(self, "_remembered_views") and self.state.mode != mode:
+            self._remembered_views.clear()
+            self._remembered_preview = self._remembered_lines = False
         self.state.mode = mode
         is_rc = mode == "Reflection"
         self.workspace_tabs.setTabVisible(
