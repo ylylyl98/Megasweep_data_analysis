@@ -66,8 +66,10 @@ class SessionMemoryMixin:
                             widget.isChecked() if isinstance(widget, QCheckBox) else widget.value())
         return values
 
-    def _session_file(self, csv_path):
+    def _session_file(self, csv_path, *, legacy=False):
         key = os.path.normcase(os.path.abspath(csv_path))
+        if getattr(self, "_fixed_mode", None) and not legacy:
+            key += "::" + self._fixed_mode
         return self._session_directory / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".json")
 
     def _schedule_session_save(self, *_):
@@ -90,6 +92,8 @@ class SessionMemoryMixin:
             "preview": self._remembered_preview, "lines": self._remembered_lines,
             "tab": self.workspace_tabs.currentIndex(),
             "axis_ranges": self._axis_ranges,
+            "spectral_slices": self.spectral_slices_panel.recipe(),
+            "transport": self.transport_panel.recipe() if self.state.mode == "Transport" else None,
         }
         path = self._session_file(self._session_path)
         try:
@@ -115,6 +119,12 @@ class SessionMemoryMixin:
         self._remembered_preview = self._remembered_lines = False
         try:
             file = self._session_file(path)
+            if not file.exists() and getattr(self, "_fixed_mode", None):
+                old_file = self._session_file(path, legacy=True)
+                if old_file.exists():
+                    old = json.loads(old_file.read_text(encoding="utf-8"))
+                    if isinstance(old, dict) and isinstance(old.get("controls"), dict) and old["controls"].get("mode_combo") == self._fixed_mode:
+                        file = old_file
             if file.exists():
                 payload = json.loads(file.read_text(encoding="utf-8"))
                 if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("controls"), dict):
@@ -186,6 +196,7 @@ class SessionMemoryMixin:
         self.state.current_ratio = self.ratio_spin.value()
         self.state.transform_convention = self._current_convention()
         self.formula_label.setText(self._formula_text())
+        self.spectral_slices_panel.restore((saved or {}).get("spectral_slices", {}))
         if not saved:
             self._schedule_session_save()
             return
@@ -246,6 +257,8 @@ class SessionMemoryMixin:
                     return
             self._show_current_map_view()
             tab = (self._pending_session or {}).get("tab", 0)
+            if tab == 1:
+                tab = self.spectral_slices_tab_index
             if isinstance(tab, int) and 0 <= tab < self.workspace_tabs.count():
                 self.workspace_tabs.setCurrentIndex(tab)
             self._append_log("Saved analysis restored. Export files were not rewritten.", "success")

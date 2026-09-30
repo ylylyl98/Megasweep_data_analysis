@@ -21,6 +21,7 @@ Sections
 
 import io
 import os
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -83,7 +84,8 @@ def _resolve_color_limits(values, vmin=None, vmax=None):
     if v0 > v1:
         v0, v1 = v1, v0
 
-    is_flat = np.isclose(v0, v1)
+    # Absolute tolerances (e.g. np.isclose's 1e-8) erase nano/picoamp ranges.
+    is_flat = v0 == v1
     if is_flat:
         pad = max(abs(v0) * 1e-6, 1e-9)
         v0 -= pad
@@ -1229,19 +1231,28 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
                      ratio=0.9, epsilon=0.03,
                      tg_is_y=True, convention='TG+rBG',
                      axis_space='gate',
-                     x_axis_name='', y_axis_name=''):
+                     x_axis_name='', y_axis_name='', exact_coordinates=False):
     """
-    Extract a line cut at a constant value of a transformed coordinate.
+    Extract spectra at a constant original X/Y or transformed D/E coordinate.
 
     When ``axis_space == 'transformed'``, x_data/y_data are treated as the
     already-loaded doping/efield coordinates directly.
     """
-    if axis_space not in {'gate', 'transformed'}:
+    original = cut_type in {'x', 'y'}
+    exact = original or exact_coordinates
+    if not np.isfinite(epsilon) or epsilon < 0:
+        raise ValueError('epsilon must be finite and zero or positive.')
+    if not np.isfinite(c_value):
+        raise ValueError('The fixed coordinate must be finite.')
+    if not original and axis_space not in {'gate', 'transformed'}:
         raise ValueError(
             "Doping/Efield line cuts require BG/TG gate axes or loaded "
             "Doping/Efield axes; generic sweep axes are not supported."
         )
-    if axis_space == 'transformed':
+    if original:
+        D, E = np.asarray(x_data, dtype=float), np.asarray(y_data, dtype=float)
+        d_label, e_label = x_axis_name or 'X', y_axis_name or 'Y'
+    elif axis_space == 'transformed':
         D, E = _transformed_axis_arrays(x_data, y_data, x_axis_name=x_axis_name, y_axis_name=y_axis_name)
         d_label = 'Doping (V)'
         e_label = 'Efield (V)'
@@ -1265,24 +1276,29 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
         else:
             raise ValueError(f"Unknown convention: {convention!r}")
 
-    if cut_type == 'doping':
+    if cut_type in {'x', 'doping'}:
         line_values = D
         vary_values = E
-        vary_label = f'E = {e_label}'
-    elif cut_type == 'efield':
+        vary_label = e_label if original else f'E = {e_label}'
+        fixed_label = d_label
+    elif cut_type in {'y', 'efield'}:
         line_values = E
         vary_values = D
-        vary_label = f'D = {d_label}'
+        vary_label = d_label if original else f'D = {d_label}'
+        fixed_label = e_label
     else:
         raise ValueError(f"Unknown cut_type: {cut_type!r}. Use 'doping' or 'efield'.")
 
-    line_values = np.round(line_values, 6)
+    line_values = np.asarray(line_values, dtype=float) if exact else np.round(line_values, 6)
     vary_values = np.asarray(vary_values, dtype=float)
-    c_value = round(c_value, 6)
+    c_value = float(c_value) if exact else round(c_value, 6)
 
-    _eps = max(float(epsilon), 1e-3)
+    _eps = float(epsilon) if exact else max(float(epsilon), 1e-3)
     dist = np.abs(line_values - c_value)
-    sel_idx = np.where(dist <= _eps)[0]
+    sel_idx = np.where((dist <= _eps) & np.isfinite(line_values) & np.isfinite(vary_values))[0]
+    metadata = {'fixed_axis_label': fixed_label,
+                'coordinate_space': 'original' if original else 'transformed',
+                'exact_coordinates': exact}
 
     if sel_idx.size == 0:
         empty = np.empty(0, dtype=float)
@@ -1296,12 +1312,13 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
             'cut_type': cut_type,
             'c_value_used': c_value,
             'ratio': ratio,
+            **metadata,
         }
 
-    unique_vary = np.unique(np.round(vary_values[sel_idx], 9))
+    unique_vary = np.unique(vary_values[sel_idx] if exact else np.round(vary_values[sel_idx], 9))
     keep = []
     for uv in unique_vary:
-        bucket = sel_idx[np.abs(vary_values[sel_idx] - uv) < 1e-9]
+        bucket = sel_idx[vary_values[sel_idx] == uv] if exact else sel_idx[np.abs(vary_values[sel_idx] - uv) < 1e-9]
         if bucket.size > 0:
             keep.append(int(bucket[np.argmin(dist[bucket])]))
 
@@ -1318,6 +1335,7 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
         'cut_type': cut_type,
         'c_value_used': c_value,
         'ratio': ratio,
+        **metadata,
     }
 
 
@@ -1372,18 +1390,31 @@ def _dominant_lattice_member_mask(values, min_fraction=0.75):
 
 
 
+def _measured_slice_values(fixed, varying, epsilon, min_points):
+    finite = np.isfinite(fixed) & np.isfinite(varying)
+    fixed, varying = fixed[finite], varying[finite]
+    return [float(value) for value in np.unique(fixed)
+            if np.unique(varying[np.abs(fixed - value) <= epsilon]).size >= min_points]
+
+
 def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
                         min_points=2, tg_is_y=True, convention='TG+rBG',
                         axis_space='gate',
                         x_axis_name='', y_axis_name='',
-                        dominant_lattice_only=True):
+                        dominant_lattice_only=True, exact_coordinates=False):
     """
     Find representative constant-axis values for batch line-cut extraction.
     """
-    if epsilon < 0:
+    if not np.isfinite(epsilon) or epsilon < 0:
         raise ValueError("epsilon must be zero or positive.")
     if min_points < 1:
         raise ValueError("min_points must be at least 1.")
+    if cut_type in {'x', 'y'}:
+        x, y = np.asarray(x_data, dtype=float), np.asarray(y_data, dtype=float)
+        fixed, varying = (x, y) if cut_type == 'x' else (y, x)
+        # Keep actual setpoints, including irregular endpoints. No voltage-specific
+        # rounding or noise floor: these axes may be in tesla, kelvin, or amperes.
+        return _measured_slice_values(fixed, varying, epsilon, min_points)
     if axis_space not in {'gate', 'transformed'}:
         raise ValueError(
             "Doping/Efield line cuts require BG/TG gate axes or loaded "
@@ -1428,6 +1459,9 @@ def find_all_cut_values(x_data, y_data, cut_type, ratio, epsilon,
     else:
         raise ValueError(f"Unknown cut_type: {cut_type!r}. Use 'doping' or 'efield'.")
 
+    if exact_coordinates:
+        varying = E if cut_type == 'doping' else D
+        return _measured_slice_values(line_values, varying, epsilon, min_points)
     line_values = np.round(line_values, 6)
     candidate_line_values = line_values[candidate_mask]
 
@@ -1611,17 +1645,36 @@ def save_map_csv(X2D, Y2D, Z2D, path,
     df.to_csv(path, index=False)
 
 
+def spectral_slice_stem(line_cut: dict) -> str:
+    """Identify a spectral slice without losing small setpoints in filenames."""
+    axis = re.sub(r'[^\w.-]+', '_', line_cut.get('fixed_axis_label', line_cut['cut_type'])).strip('_')
+    value = float(line_cut['c_value_used'])
+    stem = f"{line_cut['cut_type']}_{axis}_{'n' if value < 0 else 'p'}{abs(value):.12g}"
+    if line_cut.get('processing') == 'second_derivative':
+        stem += f"_d2dE2_w{line_cut['derivative_window']}"
+    return stem
+
+
 def save_line_csv(line_cut: dict, path: str) -> None:
     """Save a line-cut result as a CSV with energy columns."""
     energy = np.asarray(line_cut['energy'], dtype=float)
     axis_values = np.asarray(line_cut['axis_values'], dtype=float)
     spectra = np.asarray(line_cut['spectra'], dtype=float)
-    axis_label = line_cut.get('axis_label', 'axis').split(' ')[0]
+    preserve_metadata = line_cut.get('exact_coordinates', False)
+    axis_label = line_cut.get('axis_label', 'axis')
+    if not preserve_metadata:
+        axis_label = axis_label.split(' ')[0]
 
     # header: axis_value, then each energy as column header
     col_headers = [axis_label] + [f'{e:.6f}' for e in energy]
     data_rows = np.column_stack([axis_values, spectra])
     df = pd.DataFrame(data_rows, columns=col_headers)
+    if preserve_metadata:
+        df[f"fixed_{line_cut['fixed_axis_label']}"] = line_cut['c_value_used']
+    if line_cut.get('processing') == 'second_derivative':
+        df['processing'] = 'second_derivative'
+        df['derivative_window'] = line_cut['derivative_window']
+        df['signal_units'] = line_cut['signal_label']
     df.to_csv(path, index=False)
 
 

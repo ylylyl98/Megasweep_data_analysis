@@ -48,6 +48,7 @@ class MapDisplayTests(SessionMemoryFixture, unittest.TestCase):
 
     def test_csv_export_remains_full_when_display_is_zoomed(self):
         window = self.save_reflection()
+        window._save_current_view("csv")
         window.x_range_auto_check.setChecked(False)
         window.x_range_min_spin.setValue(0)
         window.x_range_max_spin.setValue(.1)
@@ -55,6 +56,7 @@ class MapDisplayTests(SessionMemoryFixture, unittest.TestCase):
         exports = list(self.root.glob("sample_outputs/*.csv"))
         self.assertEqual(len(exports), 1)
         self.assertEqual(len(pd.read_csv(exports[0])), 4)
+        self.assertIn('Unchanged CSV; skipped:', window.log_text.toPlainText())
 
     def test_controls_wrap_without_horizontal_overflow(self):
         window = self.window()

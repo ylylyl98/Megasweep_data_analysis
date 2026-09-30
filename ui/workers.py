@@ -1,4 +1,6 @@
 from __future__ import annotations
+from ui.exporting import save_line_csv, save_figure
+from spectral_processing import process_spectral_slice
 
 import os
 import traceback
@@ -21,9 +23,8 @@ from megasweep_analysis import (
     load_megasweep_csv,
     load_spectral_csv,
     plot_line_cut_spectrogram,
-    save_figure,
-    save_line_csv,
     spectral_axes_match,
+    spectral_slice_stem,
 )
 
 
@@ -693,6 +694,9 @@ class LineWorker(BaseWorker):
         background_spectra=None,
         convention: str = "TG+rBG",
         background_scale: float = 1.0,
+        exact_coordinates: bool = False,
+        spectral_processing: str | None = None,
+        derivative_window: int = 9,
     ):
         super().__init__()
         self.data = data
@@ -702,6 +706,9 @@ class LineWorker(BaseWorker):
         self.background_spectra = background_spectra
         self.convention = convention
         self.background_scale = background_scale
+        self.exact_coordinates = exact_coordinates
+        self.spectral_processing = spectral_processing
+        self.derivative_window = derivative_window
 
     def process(self) -> dict:
         if self.background_spectra is not None:
@@ -738,7 +745,11 @@ class LineWorker(BaseWorker):
                 axis_space=self.data.get("axis_space", "gate"),
                 x_axis_name=self.data.get("x_name", ""),
                 y_axis_name=self.data.get("y_name", ""),
+                exact_coordinates=self.exact_coordinates,
             )
+            if self.spectral_processing is not None:
+                line_cut = process_spectral_slice(line_cut, self.spectral_processing,
+                            self.derivative_window, is_rc=self.background_spectra is not None)
             n_pts = len(line_cut['axis_values'])
             if n_pts == 0:
                 self.log.emit(
@@ -764,6 +775,9 @@ class BatchLineWorker(BaseWorker):
         background_spectra=None,
         convention: str = "TG+rBG",
         background_scale: float = 1.0,
+        exact_coordinates: bool = False,
+        spectral_processing: str | None = None,
+        derivative_window: int = 9,
     ):
         super().__init__()
         self.data = data
@@ -775,6 +789,9 @@ class BatchLineWorker(BaseWorker):
         self.background_spectra = background_spectra
         self.convention = convention
         self.background_scale = background_scale
+        self.exact_coordinates = exact_coordinates
+        self.spectral_processing = spectral_processing
+        self.derivative_window = derivative_window
 
     def process(self) -> dict:
         os.makedirs(self.output_dir, exist_ok=True)
@@ -798,7 +815,7 @@ class BatchLineWorker(BaseWorker):
         saved_files: list[str] = []
         total_cuts = 0
 
-        _subfolder = {"doping": "doping_fixed", "efield": "efield_fixed"}
+        _subfolder = {"doping": "doping_fixed", "efield": "efield_fixed", "x": "x_fixed", "y": "y_fixed"}
 
         # Build per-cut-type work lists and compute global y ranges in one scan
         cut_type_values: dict[str, list[float]] = {}
@@ -815,6 +832,7 @@ class BatchLineWorker(BaseWorker):
                 axis_space=self.data.get("axis_space", "gate"),
                 x_axis_name=self.data.get("x_name", ""),
                 y_axis_name=self.data.get("y_name", ""),
+                exact_coordinates=self.exact_coordinates,
             )
             self.log.emit(f"Found {len(cut_values)} {cut_type} line cuts to extract.")
             cut_type_values[cut_type] = cut_values
@@ -838,6 +856,7 @@ class BatchLineWorker(BaseWorker):
                     axis_space=self.data.get("axis_space", "gate"),
                     x_axis_name=self.data.get("x_name", ""),
                     y_axis_name=self.data.get("y_name", ""),
+                    exact_coordinates=self.exact_coordinates,
                 )
                 av = lc["axis_values"]
                 if len(av):
@@ -872,6 +891,7 @@ class BatchLineWorker(BaseWorker):
                 axis_space=self.data.get("axis_space", "gate"),
                 x_axis_name=self.data.get("x_name", ""),
                 y_axis_name=self.data.get("y_name", ""),
+                exact_coordinates=self.exact_coordinates,
             )
 
             self.progress.emit(done, total_work)
@@ -879,27 +899,37 @@ class BatchLineWorker(BaseWorker):
             if len(line_cut["axis_values"]) == 0:
                 continue
 
+            if self.spectral_processing is not None:
+                line_cut = process_spectral_slice(line_cut, self.spectral_processing,
+                            self.derivative_window, is_rc=is_rc)
+
             # Use 'n'/'p' prefix instead of '+'/'-' — '+' is invalid in Windows filenames
             sign = "n" if c_value < 0 else "p"
             stem = f"{cut_type}_{sign}{abs(c_value):.4f}"
+            if cut_type in {"x", "y"} or self.exact_coordinates:
+                stem = spectral_slice_stem(line_cut)
             csv_path = os.path.join(subfolder, f"{stem}.csv")
-            save_line_csv(line_cut, csv_path)
-            saved_files.append(csv_path)
+            exported = save_line_csv(line_cut, csv_path)
+            self.log.emit(exported.message)
+            if exported.created:
+                saved_files.append(str(exported.path))
 
             spectra_array = np.asarray(line_cut["spectra"])
             if spectra_array.shape[0] >= 2:
                 cmap = "RdBu_r" if is_rc else "jet"
-                z_label = "RC (ΔI/I₀)" if is_rc else "PL Intensity (a.u.)"
+                z_label = line_cut.get("signal_label", "RC (ΔI/I₀)" if is_rc else "PL Intensity (a.u.)")
+                if self.spectral_processing == "second_derivative":
+                    cmap = "RdBu_r"
                 fig, _ = plot_line_cut_spectrogram(
                     line_cut,
-                    title=f"{cut_type.capitalize()} = {c_value:.3f} V",
+                    title=f"{line_cut.get('fixed_axis_label', cut_type)} = {c_value:.12g}",
                     cmap=cmap,
                     z_label=z_label,
                     ylim=global_ylim.get(cut_type),
                 )
                 png_path = os.path.join(subfolder, f"{stem}.png")
-                save_figure(fig, png_path)
-                saved_files.append(png_path)
+                exported = save_figure(fig, png_path)
+                saved_files.append(str(exported.path))
 
             total_cuts += 1
 

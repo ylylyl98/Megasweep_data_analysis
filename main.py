@@ -1,7 +1,7 @@
 """
 main.py
 =======
-Entry point for the Megasweep PL Analysis desktop app.
+Entry point for the Megasweep Analysis desktop app.
 
 Launch:
     python main.py
@@ -33,7 +33,7 @@ APP_ICON_PATH = os.path.join(APP_DIR, "assets", "megasweep.ico")
 
 _CRASH_LOG_PATH = os.path.join(APP_DIR, "megasweep_crash.log")
 APP_ID = "YanLab.MegasweepAnalysis"
-APP_NAME = "Megasweep PL Analysis"
+APP_NAME = "Megasweep Analysis"
 
 
 def _log_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:

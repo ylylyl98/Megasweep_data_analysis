@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from PySide6.QtWidgets import QApplication
-from ui.main_window import MainWindow
+from ui.measurement_workspace import MeasurementWorkspace as MainWindow
 
 
 class SidebarLayoutTests(unittest.TestCase):
