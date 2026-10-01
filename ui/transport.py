@@ -9,14 +9,16 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel, QPushButton,
-    QCheckBox, QLineEdit, QTabWidget, QSizePolicy,
+    QCheckBox, QTabWidget, QSizePolicy,
 )
 
-from megasweep_analysis import plot_map
+from megasweep_analysis import plot_map, update_map_colors
 from ui.exporting import save_dataframe, save_figure, save_figure_with_axes_size
 from transport_analysis import load_transport_csv, transport_map, transport_cut, transport_curve
 from ui.workers import BaseWorker
 from ui.plot_ranges import PlotRangeControls
+from ui.widgets import NumericLineEdit
+from ui.auto_update import AutoUpdateControls
 
 
 class TransportLoadWorker(BaseWorker):
@@ -37,6 +39,8 @@ class TransportPanel(QWidget):
         self.log = log
         self.data = self.result = self.cut = None
         self._updating = False
+        self._map_stale = self._cut_stale = True
+        self.active = lambda: True
         layout = QVBoxLayout(self)
         layout.setSpacing(4)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -60,15 +64,14 @@ class TransportPanel(QWidget):
         self.cmap_combo.addItems(['RdBu_r', 'viridis', 'jet', 'plasma', 'inferno', 'seismic'])
         self.auto_scale = QCheckBox('Auto color scale')
         self.auto_scale.setChecked(True)
-        self.min_edit, self.max_edit = QLineEdit('0'), QLineEdit('1e-9')
-        self.min_edit.setMaximumWidth(120)
-        self.max_edit.setMaximumWidth(120)
+        self.min_edit, self.max_edit = NumericLineEdit('0'), NumericLineEdit('1e-9')
         for widget in (self.min_edit, self.max_edit):
             widget.setEnabled(False)
             widget.setToolTip('Signal units; scientific notation is accepted, e.g. -2e-9.')
-        self.refresh_button = QPushButton('Refresh Plot')
-        self.refresh_button.setProperty('class', 'primary')
-        self.refresh_button.clicked.connect(self.refresh_map)
+        self.map_updates = AutoUpdateControls(lambda: self.refresh_map(automatic=True),
+                                             self._can_auto_map, parent=self, manual_callback=self.refresh_map)
+        self.refresh_button = self.map_updates.button
+        self.map_updates.preference_changed.connect(self.changed.emit)
         settings_layout.addWidget(self.axis_hint)
         settings_layout.addWidget(self.suggest_button)
         self._row(settings_layout, [('Plot', self.plot_kind_combo)])
@@ -88,7 +91,7 @@ class TransportPanel(QWidget):
         self.map_ranges = PlotRangeControls()
         self.map_ranges.changed.connect(self.changed.emit)
         settings_layout.addWidget(self.map_ranges)
-        settings_layout.addWidget(self.refresh_button)
+        settings_layout.addWidget(self.map_updates)
         layout.addWidget(self.settings_widget)
         self.status = QLabel('Load a Transport CSV, then select X, Y and signal from its headers.')
         self.status.setWordWrap(True)
@@ -101,15 +104,17 @@ class TransportPanel(QWidget):
         cut_layout = QVBoxLayout(cut_workspace)
         cut_layout.setSpacing(4)
         self.fixed_combo, self.cut_value_combo = QComboBox(), QComboBox()
-        self.cut_button = QPushButton('Plot Cut')
-        self.cut_button.clicked.connect(self.refresh_cut)
+        self.cut_updates = AutoUpdateControls(lambda: self.refresh_cut(automatic=True),
+                                             self._can_auto_cut, parent=self, manual_callback=self.refresh_cut)
+        self.cut_button = self.cut_updates.button
+        self.cut_updates.preference_changed.connect(self.changed.emit)
         self.cut_controls_widget = QWidget()
         cut_controls_layout = QVBoxLayout(self.cut_controls_widget)
         cut_controls_layout.setSpacing(4)
         cut_controls_layout.setContentsMargins(0, 0, 0, 0)
         self._row(cut_controls_layout, [('Fixed column', self.fixed_combo)])
         self._row(cut_controls_layout, [('Value', self.cut_value_combo)])
-        cut_controls_layout.addWidget(self.cut_button)
+        cut_controls_layout.addWidget(self.cut_updates)
         self.cut_ranges = PlotRangeControls()
         self.cut_ranges.changed.connect(self.changed.emit)
         cut_controls_layout.addWidget(self.cut_ranges)
@@ -140,7 +145,31 @@ class TransportPanel(QWidget):
         self.auto_scale.toggled.connect(self._color_changed)
         self.min_edit.editingFinished.connect(self._color_changed)
         self.max_edit.editingFinished.connect(self._color_changed)
+        self.tabs.currentChanged.connect(self._tab_changed)
         self.clear()
+
+    def _selection_valid(self):
+        names = [self.x_combo.currentData(), self.channel_combo.currentData()]
+        if self.plot_kind_combo.currentData() == 'map':
+            names.append(self.y_combo.currentData())
+        return self.data is not None and all(name in self.data['columns'] for name in names) and len(set(names)) == len(names)
+
+    def _can_auto_map(self):
+        return self.isEnabled() and self.active() and self._map_stale and self._selection_valid() and not self._updating
+
+    def _can_auto_cut(self):
+        return (self.isEnabled() and self.active() and self.tabs.currentIndex() == 1
+                and not self._map_stale and self.result is not None and self.result['kind'] == 'map'
+                and self._cut_stale and self.cut_value_combo.currentData() is not None and not self._updating)
+
+    def _tab_changed(self, *_):
+        if self.tabs.currentIndex() == 1:
+            self.cut_updates.request()
+        self.map_updates.resume()
+
+    def cancel_updates(self):
+        self.map_updates.cancel()
+        self.cut_updates.cancel()
 
     @staticmethod
     def _row(layout, items):
@@ -168,7 +197,9 @@ class TransportPanel(QWidget):
         return container
 
     def clear(self):
+        self.cancel_updates()
         self._updating = True
+        self._map_stale = self._cut_stale = True
         self.data = self.result = self.cut = None
         self.map_ranges.reset()
         self.cut_ranges.reset()
@@ -193,6 +224,8 @@ class TransportPanel(QWidget):
         self.clear()
         self._updating = True
         self.data = data
+        self.map_updates.checkbox.setChecked(not isinstance(recipe, dict) or recipe.get('auto_update', True) is not False)
+        self.cut_updates.checkbox.setChecked(not isinstance(recipe, dict) or recipe.get('auto_cut_update', True) is not False)
         for combo in (self.x_combo, self.y_combo, self.channel_combo):
             for name in data['columns']:
                 combo.addItem(self._label(name), name)
@@ -245,6 +278,8 @@ class TransportPanel(QWidget):
             if recipe.get('cut') and index >= 0:
                 self.cut_ranges.restore(recipe.get('cut_ranges'))
                 self.refresh_cut()
+        if self.result is None:
+            self.map_updates.request()
 
     def _selection_controls(self):
         return dict(x=self.x_combo, y=self.y_combo, channel=self.channel_combo,
@@ -283,6 +318,8 @@ class TransportPanel(QWidget):
     def recipe(self):
         return {**{key: combo.currentData() for key, combo in self._selection_controls().items()},
                 'kind': self.plot_kind_combo.currentData(),
+                'auto_update': self.map_updates.checkbox.isChecked(),
+                'auto_cut_update': self.cut_updates.checkbox.isChecked(),
                 'cmap': self.cmap_combo.currentText(), 'auto_scale': self.auto_scale.isChecked(),
                 'min': self.min_edit.text(), 'max': self.max_edit.text(),
                 'map_ranges': self.map_ranges.recipe(), 'cut_ranges': self.cut_ranges.recipe(),
@@ -309,41 +346,42 @@ class TransportPanel(QWidget):
         self.tabs.setTabEnabled(1, is_map)
         self.tabs.setTabVisible(1, is_map)
         self.refresh_button.setEnabled(self.data is not None)
-        self.cut_button.setEnabled(is_map and self.result is not None and self.cut_value_combo.count() > 0)
+        self.cut_button.setEnabled(is_map and self.result is not None and not self._map_stale and self.cut_value_combo.count() > 0)
         self.fixed_combo.setEnabled(is_map)
         self.cut_value_combo.setEnabled(is_map)
         for (kind, _), button in self.export_buttons.items():
-            button.setEnabled(self.result is not None if kind == 'map' else self.cut is not None)
+            button.setEnabled(self.result is not None and not self._map_stale if kind == 'map'
+                              else self.cut is not None and not self._cut_stale and not self._map_stale)
             button.setVisible(kind == 'map' or is_map)
+        self.map_plot.set_export_enabled(self.result is not None and not self._map_stale and self.isEnabled())
+        self.cut_plot.set_export_enabled(self.cut is not None and not self._cut_stale and not self._map_stale and self.isEnabled())
         for extension in ('png', 'csv'):
             self.export_buttons[('map', extension)].setText(f"Save {'Map' if is_map else 'Curve'} {extension.upper()}")
 
     def _selection_changed(self, *_):
         if self._updating:
             return
-        self.result = None
-        self.map_ranges.detach()
+        self._map_stale = True
         if self.sender() in (self.x_combo, self.y_combo, self.channel_combo, self.plot_kind_combo, self.suggest_button):
             self.map_ranges.reset()
             self.cut_ranges.reset()
         if self.sender() in (self.x_combo, self.y_combo, self.plot_kind_combo):
             self._restored_axes = False
-        self.map_plot.clear()
-        self.fixed_combo.clear()
         self._clear_cut()
-        self.status.setText('Selection changed. Refresh Plot to display these columns and filters.')
+        self.status.setText('Selection changed; previous plot is out of date. '
+                            + ('Waiting to update…' if self.map_updates.checkbox.isChecked() else 'Click Update Now.'))
         self._update_actions()
         self._update_axis_hint()
         self.changed.emit()
+        self.map_updates.request()
 
     def _clear_cut(self, *_):
         if self._updating:
             return
-        self.cut = None
-        self.cut_ranges.detach()
-        self.cut_plot.clear()
+        self._cut_stale = True
         self._update_actions()
         self.changed.emit()
+        self.cut_updates.request()
 
     def _cut_axis_changed(self, *_):
         if self._updating:
@@ -407,14 +445,22 @@ class TransportPanel(QWidget):
         self._update_actions()
         try:
             if self.result is not None:
-                self._draw_map()
+                if self.result['kind'] == 'map':
+                    low, high = self._limits()
+                    figure = self.map_plot.current_figure
+                    if update_map_colors(figure, self.result['Z2D'], self.cmap_combo.currentText(), low, high):
+                        figure.canvas.draw_idle()
         except ValueError as exc:
             self.status.setText(str(exc))
         self.changed.emit()
 
-    def refresh_map(self):
+    def refresh_map(self, *, automatic=False):
+        self.map_updates.cancel()
         if self.data is None:
             return
+        fixed, value = self.fixed_combo.currentText(), self.cut_value_combo.currentData()
+        selected_tab = self.tabs.currentIndex()
+        previous = self.result
         try:
             if self.plot_kind_combo.currentData() == 'curve':
                 self.result = transport_curve(self.data, self.x_combo.currentData(), self.channel_combo.currentData(),
@@ -424,11 +470,22 @@ class TransportPanel(QWidget):
                                         self.channel_combo.currentData(), direction=self.direction_combo.currentData(),
                                         pass_index=self.pass_combo.currentData())
             self._draw_map()
+            self._map_stale = False
+            self._updating = True
             self.fixed_combo.clear()
             if self.result['kind'] == 'map':
                 self.fixed_combo.addItems([self.result['x_name'], self.result['y_name']])
+                if self.fixed_combo.findText(fixed) >= 0:
+                    self.fixed_combo.setCurrentText(fixed)
+            self._updating = False
             self._cut_axis_changed()
-            self.tabs.setCurrentIndex(0)
+            index = self.cut_value_combo.findData(value)
+            if index >= 0:
+                self.cut_value_combo.setCurrentIndex(index)
+            if not automatic:
+                self.tabs.setCurrentIndex(0)
+            elif selected_tab == 1 and self.cut_updates.checkbox.isChecked():
+                self.refresh_cut(automatic=True)
             r = self.result
             if r['kind'] == 'map':
                 self.status.setText(f"{len(r['samples'])} measured points; {np.isnan(r['Z2D']).sum()} blank cells. "
@@ -437,17 +494,17 @@ class TransportPanel(QWidget):
                 self.status.setText(f"{len(r['samples'])} measured points. Signal is the vertical axis. "
                                     'Scan order is preserved; passes/directions are plotted separately.')
         except (ValueError, KeyError) as exc:
-            self.result = None
-            self.map_ranges.detach()
-            self.map_plot.clear()
+            self.result = previous
+            self._map_stale = True
             self._clear_cut()
             self.status.setText(str(exc))
             self.log(str(exc), 'warn')
         self._update_actions()
         self.changed.emit()
 
-    def refresh_cut(self):
-        if self.result is None or self.result['kind'] != 'map' or self.cut_value_combo.currentData() is None:
+    def refresh_cut(self, *, automatic=False):
+        self.cut_updates.cancel()
+        if self._map_stale or self.result is None or self.result['kind'] != 'map' or self.cut_value_combo.currentData() is None:
             return
         try:
             self.cut = transport_cut(self.result, self.fixed_combo.currentText(), self.cut_value_combo.currentData())
@@ -463,7 +520,9 @@ class TransportPanel(QWidget):
             ax.set_title(f"{self._title()} | {self._label(c['fixed_axis'])} = {c['fixed_value']:.12g}")
             self.cut_plot.set_figure(fig)
             self.cut_ranges.attach(fig)
-            self.tabs.setCurrentIndex(1)
+            self._cut_stale = False
+            if not automatic:
+                self.tabs.setCurrentIndex(1)
         except ValueError as exc:
             self._clear_cut()
             self.status.setText(str(exc))
@@ -472,7 +531,7 @@ class TransportPanel(QWidget):
 
     def export(self, kind, extension):
         r = self.result if kind == 'map' else self.cut
-        if r is None:
+        if r is None or self._map_stale or (kind == 'cut' and self._cut_stale) or not self.isEnabled():
             return
         try:
             names = [self.result['kind'] if kind == 'map' else kind, self.result['channel'], self.result['x_name'],

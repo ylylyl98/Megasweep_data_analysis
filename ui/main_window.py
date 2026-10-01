@@ -22,6 +22,12 @@ class MainWindow(QMainWindow):
             self.workspaces[mode] = workspace
             self.workspace_tabs.addTab(workspace, mode)
         self.setCentralWidget(self.workspace_tabs)
+        self.workspace_tabs.currentChanged.connect(self._activate_workspace)
+        self._activate_workspace()
+
+    def _activate_workspace(self, *_):
+        for workspace in self.workspaces.values():
+            workspace.set_auto_update_active(self.workspace_tabs.currentWidget() is workspace)
 
     def closeEvent(self, event):
         # Hidden tabs may still be calculating: never destroy an active QThread.
@@ -34,4 +40,5 @@ class MainWindow(QMainWindow):
         for workspace in self.workspaces.values():
             workspace._save_session()
             workspace._session_save_timer.stop()
+            workspace._stop_auto_updates()
         super().closeEvent(event)

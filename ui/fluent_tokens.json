@@ -1,0 +1,150 @@
+{
+  "source": {
+    "title": "Microsoft Fluent UI v9 resolved web theme tokens",
+    "package": "@fluentui/react-theme",
+    "packageVersion": "9.2.1",
+    "extractedAt": "2026-07-12",
+    "tokenCountPerTheme": 459,
+    "officialRepository": "microsoft/fluentui",
+    "officialSourcePaths": [
+      "packages/tokens/src/themes/web/lightTheme.ts",
+      "packages/tokens/src/themes/web/darkTheme.ts",
+      "packages/tokens/src/global/brandColors.ts",
+      "packages/tokens/src/alias/lightColor.ts",
+      "packages/tokens/src/alias/darkColor.ts"
+    ],
+    "note": "Resolved values from the latest published official @fluentui/react-theme package available on the extraction date; cross-checked against the current official GitHub source generation paths."
+  },
+  "aliases": {
+    "window_background": {
+      "token": "colorNeutralBackground2",
+      "light": "#fafafa",
+      "dark": "#1f1f1f"
+    },
+    "surface_background": {
+      "token": "colorNeutralBackground1",
+      "light": "#ffffff",
+      "dark": "#292929"
+    },
+    "surface_background_hover": {
+      "token": "colorNeutralBackground1Hover",
+      "light": "#f5f5f5",
+      "dark": "#3d3d3d"
+    },
+    "surface_background_pressed": {
+      "token": "colorNeutralBackground1Pressed",
+      "light": "#e0e0e0",
+      "dark": "#1f1f1f"
+    },
+    "surface_secondary": {
+      "token": "colorNeutralBackground2",
+      "light": "#fafafa",
+      "dark": "#1f1f1f"
+    },
+    "surface_tertiary": {
+      "token": "colorNeutralBackground3",
+      "light": "#f5f5f5",
+      "dark": "#141414"
+    },
+    "surface_disabled": {
+      "token": "colorNeutralBackgroundDisabled",
+      "light": "#f0f0f0",
+      "dark": "#141414"
+    },
+    "text_primary": {
+      "token": "colorNeutralForeground1",
+      "light": "#242424",
+      "dark": "#ffffff"
+    },
+    "text_secondary": {
+      "token": "colorNeutralForeground2",
+      "light": "#424242",
+      "dark": "#d6d6d6"
+    },
+    "text_tertiary": {
+      "token": "colorNeutralForeground3",
+      "light": "#616161",
+      "dark": "#adadad"
+    },
+    "text_disabled": {
+      "token": "colorNeutralForegroundDisabled",
+      "light": "#bdbdbd",
+      "dark": "#5c5c5c"
+    },
+    "border_primary": {
+      "token": "colorNeutralStroke1",
+      "light": "#d1d1d1",
+      "dark": "#666666"
+    },
+    "border_subtle": {
+      "token": "colorNeutralStroke2",
+      "light": "#e0e0e0",
+      "dark": "#525252"
+    },
+    "border_accessible": {
+      "token": "colorNeutralStrokeAccessible",
+      "light": "#616161",
+      "dark": "#adadad"
+    },
+    "focus_border": {
+      "token": "colorStrokeFocus2",
+      "light": "#000000",
+      "dark": "#ffffff"
+    },
+    "brand_background": {
+      "token": "colorBrandBackground",
+      "light": "#0f6cbd",
+      "dark": "#115ea3"
+    },
+    "brand_background_hover": {
+      "token": "colorBrandBackgroundHover",
+      "light": "#115ea3",
+      "dark": "#0f6cbd"
+    },
+    "brand_background_pressed": {
+      "token": "colorBrandBackgroundPressed",
+      "light": "#0c3b5e",
+      "dark": "#0c3b5e"
+    },
+    "brand_foreground": {
+      "token": "colorBrandForeground1",
+      "light": "#0f6cbd",
+      "dark": "#479ef5"
+    },
+    "brand_border": {
+      "token": "colorBrandStroke1",
+      "light": "#0f6cbd",
+      "dark": "#479ef5"
+    },
+    "brand_background_subtle": {
+      "token": "colorBrandBackground2",
+      "light": "#ebf3fc",
+      "dark": "#082338"
+    },
+    "selection_strong_background": {
+      "token": "colorBrandBackground",
+      "light": "#0f6cbd",
+      "dark": "#115ea3"
+    },
+    "selection_strong_foreground": {
+      "token": "colorNeutralForegroundOnBrand",
+      "light": "#ffffff",
+      "dark": "#ffffff"
+    },
+    "selection_subtle_background": {
+      "token": "colorBrandBackground2",
+      "light": "#ebf3fc",
+      "dark": "#082338"
+    },
+    "selection_subtle_foreground": {
+      "token": "colorNeutralForeground1",
+      "light": "#242424",
+      "dark": "#ffffff"
+    },
+    "danger_foreground": {
+      "token": "colorStatusDangerForeground1",
+      "light": "#b10e1c",
+      "dark": "#dc626d"
+    }
+  }
+}

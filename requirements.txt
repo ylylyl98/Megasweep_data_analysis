@@ -4,3 +4,4 @@ pandas
 matplotlib
 Pillow
 scipy
+imageio-ffmpeg>=0.5,<1

@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from PySide6.QtCore import Qt, QThread, Slot
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QComboBox, QFileDialog, QMessageBox, QTableWidgetItem, QWidget
+from PySide6.QtWidgets import QAbstractSpinBox, QComboBox, QFileDialog, QMessageBox, QTableWidgetItem, QWidget
 
 from megasweep_analysis import (
     estimate_global_baseline,
@@ -40,9 +40,10 @@ from ui.transport import TransportLoadWorker
 from ui.optical_layout import OpticalLayoutMixin
 from ui.reflection_workflow import ReflectionWorkflowMixin
 from ui.plot_results import PlotResultsMixin
+from ui.automatic_workspace import AutomaticWorkspaceMixin
 
 
-class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResultsMixin,
+class MeasurementWorkspace(AutomaticWorkspaceMixin, OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResultsMixin,
                            MapDisplayMixin, SessionMemoryMixin, QWidget):
     _EXPORT_MAP_AXES_SIZE = (3.0, 3.0)
     _LOG_COLORS = {
@@ -96,8 +97,11 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         }
 
         self._setup_ui()
+        for spin in self.findChildren(QAbstractSpinBox):
+            spin.setKeyboardTracking(False)
         self._setup_map_display()
         self._setup_session_memory(session_directory)
+        self._setup_auto_updates()
         self.transport_panel.changed.connect(self._schedule_session_save)
         if self._fixed_mode:
             self._on_mode_changed(self._fixed_mode)
@@ -149,6 +153,8 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
     def _mark_dirty(self, *keys: str) -> None:
         for key in keys:
             self._dirty_views[key] = True
+        if self._current_view_key() in keys:
+            self._request_map_update()
 
     def _mark_clean(self, *keys: str) -> None:
         for key in keys:
@@ -192,9 +198,9 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             case "intensity_transformed":
                 return ["intensity_original", "intensity_transformed"]
             case "peak_original":
-                return ["intensity_original", "peak_original"]
+                return ["peak_original"]
             case "peak_transformed":
-                return ["intensity_original", "intensity_transformed", "peak_transformed"]
+                return ["peak_transformed"]
             case "fixed_original":
                 return ["fixed_original"]
             case "fixed_transformed":
@@ -236,6 +242,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         self.save_current_png_btn.setEnabled(self._current_map_figure() is not None)
         self.save_current_csv_btn.setEnabled(self._current_map_payload() is not None)
         self._refresh_stage_states()
+        self._request_map_update()
 
     def _update_status_labels(self) -> None:
         if self.state.data is None:
@@ -269,7 +276,9 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
                 dirty_names["fixed_transformed"] = "RC at energy/transformed"
         dirty_list = [label for key, label in dirty_names.items() if self._dirty_views.get(key, False)]
         if dirty_list:
-            self.analysis_status_label.setText(f"{len(dirty_list)} views need refresh. Choose a map and refresh it.")
+            self.analysis_status_label.setText(f"{len(dirty_list)} views need updates. "
+                                               + ('Only the visible plot updates automatically.' if self.map_auto_update_check.isChecked()
+                                                  else 'Choose a map and click Update Now.'))
             self.analysis_status_label.setToolTip("Needs refresh: " + ", ".join(dirty_list) + ".")
         else:
             self.analysis_status_label.setText("All cached views are up to date with the current settings.")
@@ -278,7 +287,10 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         current_key = self._current_view_key()
         if self._dirty_views.get(current_key, True):
             self.map_status_label.setText(
-                f"{self._current_view_description()} is stale. Use Refresh Current View to update it."
+                f"{self._current_view_description()} is out of date. "
+                + ('Updating… Previous plot remains visible.' if self._thread is not None
+                   else 'Waiting to update; previous plot remains visible.' if self.map_auto_update_check.isChecked()
+                   else 'Click Update Now to apply the current settings.')
             )
         elif self._current_map_figure() is None:
             self.map_status_label.setText(
@@ -306,6 +318,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             self.linecuts_status_label.setText("Line cuts match the current transformed coordinate settings.")
 
     def _refresh_current_map_view(self) -> None:
+        self.map_updates.cancel()
         if self.state.data is None:
             self._append_log("Load a CSV before refreshing map views.", "error")
             return
@@ -332,6 +345,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         self._start_analysis_refresh(tasks, f"Refreshing {self._current_view_description()}")
 
     def _refresh_all_maps(self) -> None:
+        self.map_updates.cancel()
         if self.state.data is None:
             self._append_log("Load a CSV before refreshing map views.", "error")
             return
@@ -418,14 +432,20 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             return
 
         def on_ready(payload):
-            self._on_analysis_refresh_ready({**cached, **payload})
+            combined = {**cached, **payload}
+            valid = {self._MAP_CACHE_FIELDS[task][1]: combined[self._MAP_CACHE_FIELDS[task][1]]
+                     for task in tasks if signatures[task] == self._map_calculation_signature(task)
+                     and self._MAP_CACHE_FIELDS[task][1] in combined}
+            self._on_analysis_refresh_ready(valid)
             for task in tasks:
                 attribute, payload_key = self._MAP_CACHE_FIELDS[task]
-                if payload_key in payload or payload_key in cached:
+                if payload_key in valid:
                     self._map_cache_signatures[task] = signatures[task]
                     # Controls can change while the worker runs. Never label an
                     # old calculation as valid for those newly selected values.
                     self._dirty_views[task] = signatures[task] != self._map_calculation_signature(task)
+                else:
+                    self._dirty_views[task] = True
 
         worker = AnalysisRefreshWorker(
             self.state.data,
@@ -520,6 +540,9 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         return path
 
     def _save_current_view(self, output_type: str) -> None:
+        if self._thread is not None or self._dirty_views.get(self._current_view_key(), True) or not self._auto_file_matches():
+            self._append_log('Update the selected plot before exporting.', 'warn')
+            return
         payload = self._current_map_payload()
         figure = self._current_map_figure()
         if payload is None or figure is None:
@@ -860,13 +883,9 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             return
         self.state.original_map = None
         self.state.transformed_map = None
-        self.state.figures.pop("original_map", None)
-        self.state.figures.pop("transformed_map", None)
         if self.state.mode == "Reflection":
             self.state.peak_map_original = None
             self.state.peak_map_transformed = None
-            self.state.figures.pop("peak_map_original", None)
-            self.state.figures.pop("peak_map_transformed", None)
             self._mark_dirty(
                 "intensity_original",
                 "intensity_transformed",
@@ -890,7 +909,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         if self.state.mode == "Reflection":
             if self._reflection_preview_message is not None:
                 # A preview is already visible — refresh it in-place with the new energy window
-                self._preview_reflection_spectra()
+                self._request_preview_update()
             else:
                 self._clear_reflection_preview()
         elif self.auto_baseline_check.isChecked() and self.state.data is not None:
@@ -899,6 +918,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         if (
             self.state.mode == "Reflection"
             and self.state.background_spectra is not None
+            and self._reflection_preview_message is None
         ):
             try:
                 self._refresh_raw_background_plot()
@@ -913,11 +933,9 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             return
         self.state.rc_fixed_map_original = None
         self.state.rc_fixed_map_transformed = None
-        self.state.figures.pop("fixed_map_original", None)
-        self.state.figures.pop("fixed_map_transformed", None)
         self._mark_dirty("fixed_original", "fixed_transformed")
         if self.state.mode == "Reflection" and self._reflection_preview_message is not None:
-            self._preview_reflection_spectra()
+            self._request_preview_update()
         self._show_current_map_view()
         self._append_log(
             f"Fixed RC energy changed to {self.fixed_energy_spin.value():.6f} eV. "
@@ -980,8 +998,6 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         self.state.current_ratio = self.ratio_spin.value()
         if self.state.data is None:
             return
-        if self.state.mode == "Reflection":
-            self._clear_reflection_preview()
         self.state.transformed_map = None
         self.state.peak_map_transformed = None
         self.state.rc_fixed_map_transformed = None
@@ -995,7 +1011,8 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         self.state.figures.pop("ibias_map_transformed", None)
         self.state.figures.pop("resistance_map_transformed", None)
         self.state.figures.pop("line_cuts", None)
-        self.line_plot_tab.clear()
+        if self._reflection_preview_message is None:
+            self.line_plot_tab.clear()
         self._mark_dirty(
             "intensity_transformed",
             "peak_transformed",
@@ -1029,7 +1046,8 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         self.state.figures.pop("ibias_map_transformed", None)
         self.state.figures.pop("resistance_map_transformed", None)
         self.state.figures.pop("line_cuts", None)
-        self.line_plot_tab.clear()
+        if self._reflection_preview_message is None:
+            self.line_plot_tab.clear()
         self._mark_dirty(
             "intensity_transformed",
             "peak_transformed",
@@ -1091,11 +1109,9 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         if self.state.data is None:
             return
         if self.state.mode == "Reflection" and self._reflection_preview_message is not None:
-            self._preview_reflection_spectra()
+            self._request_preview_update()
         self.state.peak_map_original = None
         self.state.peak_map_transformed = None
-        self.state.figures.pop("peak_map_original", None)
-        self.state.figures.pop("peak_map_transformed", None)
         self._mark_dirty("peak_original", "peak_transformed")
         self._show_current_map_view()
         self._append_log("Peak settings changed. Peak views need refresh.", "warn")
@@ -1493,7 +1509,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         context = f"Batch extracting {' + '.join(cut_types)} line cuts"
         self._run_worker(worker, self._on_batch_lines_ready, context=context)
 
-    def _run_worker(self, worker, on_success, context: str) -> None:
+    def _run_worker(self, worker, on_success, context: str, *, quiet=False) -> None:
         if self._thread is not None:
             self._append_log("An analysis task is already running. Please wait for it to finish.", "warn")
             return
@@ -1519,7 +1535,8 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         worker.error.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup_worker)
         self._thread.start()
-        self._append_log(context, "info")
+        if not quiet:
+            self._append_log(context, "info")
 
     @Slot(object)
     def _dispatch_worker_result(self, result) -> None:
@@ -1551,6 +1568,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
         self._refresh_stage_states()
         self._advance_session_restore()
         self._schedule_session_save()
+        self._resume_auto_updates()
 
     def _on_worker_finished(self, _result) -> None:
         try:
@@ -1669,6 +1687,9 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             self._append_log(traceback.format_exc(), "error")
 
     def _invalidate_from_stage(self, stage_number: int, message: str) -> None:
+        self.map_updates.cancel()
+        self.preview_updates.cancel()
+        self.spectral_slices_panel.updates.cancel()
         self.state.reset_from_stage(stage_number)
         if stage_number <= 1:
             x_name = self.vbg_combo.currentText().strip() or "X"
@@ -1677,15 +1698,16 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
                 f"Axis selection: X={x_name}, Y={y_name} | Reload the CSV to apply this selection."
             )
         self._dirty_views = {k: True for k in self._dirty_views.keys()}
-        self._clear_reflection_preview()
-        for plot_tab in [
-            self.map_plot_tab,
-            self.line_plot_tab,
-            self.raw_background_plot_tab,
-        ]:
-            plot_tab.clear()
+        if stage_number <= 1:
+            self._clear_reflection_preview()
+            for plot_tab in (self.map_plot_tab, self.line_plot_tab, self.raw_background_plot_tab):
+                plot_tab.clear()
+        else:
+            self._request_preview_update()
         self._append_log(message, "warn")
         self._refresh_stage_states()
+        if stage_number > 1:
+            self._request_map_update()
 
     def _on_csv_loaded(self, result: dict) -> None:
         try:
@@ -1837,6 +1859,8 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
                 self.analysis_section.set_expanded(True)
                 self.sidebar_scroll.ensureWidgetVisible(self.analysis_section, 0, 16)
             self._restore_session_loaded()
+            self._request_map_update()
+            self._visible_view_changed()
         except Exception:
             self._append_log(traceback.format_exc(), "error")
 
@@ -1895,7 +1919,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             self.bg_section.hide()
             self.workspace_tabs.setTabVisible(self.raw_background_tab_index, False)
             self.workspace_tabs.setCurrentIndex(self.transport_tab_index)
-            self.workflow_hint_label.setText("Load CSV → Review suggested axes and choose Signal → Refresh Plot → Export")
+            self.workflow_hint_label.setText("Load CSV → Review axes and choose Signal → View / Update Now → Export")
             self._refresh_stage_states()
             return
         is_rc = mode == "Reflection"
@@ -1948,7 +1972,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             self.export_section.toggle.setText("4  Export")
             self.workflow_hint_label.setText(
                 "1. Load data  →  2. Load background  →  3. Preview one RC frame "
-                "and select a window or fixed energy  →  4. Refresh a map"
+                "and select a window or fixed energy  →  4. View / Update Now"
             )
             self.sidebar_scroll.ensureWidgetVisible(self.bg_section, 0, 16)
         else:
@@ -1956,7 +1980,7 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             self.linecuts_section.toggle.setText("3  Line Cuts")
             self.export_section.toggle.setText("3  Export")
             self.workflow_hint_label.setText(
-                "1. Load data  →  2. Choose analysis settings  →  3. Refresh a map"
+                "1. Load data  →  2. Choose analysis settings  →  3. View / Update Now"
             )
 
         # Show/hide baseline
@@ -2038,9 +2062,11 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             self.extract_all_efield_btn.setEnabled(bool(batch_linecuts_ready))
             self.extract_all_both_btn.setEnabled(bool(batch_linecuts_ready))
 
-            save_enabled = bool(self._current_map_figure() is not None)
+            current_valid = not self._dirty_views.get(self._current_view_key(), True) and self._thread is None and self._auto_file_matches()
+            save_enabled = bool(self._current_map_figure() is not None and current_valid)
             self.save_current_png_btn.setEnabled(save_enabled)
-            self.save_current_csv_btn.setEnabled(bool(self._current_map_payload() is not None))
+            self.save_current_csv_btn.setEnabled(bool(self._current_map_payload() is not None and current_valid))
+            self.map_plot_tab.set_export_enabled(save_enabled)
             has_any_map = any(
                 map_data is not None
                 for map_data in (
@@ -2060,6 +2086,12 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
             has_lines = self.state.figures.get("line_cuts") is not None
             self.save_lines_png_btn.setEnabled(has_lines)
             self.save_lines_csv_btn.setEnabled(bool(self.state.line_cut_results))
+            line_valid = (self._thread is None and self._auto_file_matches()
+                          and (not self._preview_stale if self._reflection_preview_message is not None
+                               else not self._dirty_views.get('line_cuts', True)))
+            self.line_plot_tab.set_export_enabled(line_valid)
+            self.raw_background_plot_tab.set_export_enabled(self._thread is None and self._auto_file_matches())
+            self._resume_auto_updates()
         except Exception:
             self._append_log(traceback.format_exc(), "error")
 
@@ -2069,6 +2101,9 @@ class MeasurementWorkspace(OpticalLayoutMixin, ReflectionWorkflowMixin, PlotResu
     # ── Save helpers ──────────────────────────────────────────────────────
 
     def _save_map(self, kind: str, output_type: str) -> None:
+        if self._dirty_views.get('intensity_' + kind, True) or self._thread is not None or not self._auto_file_matches():
+            self._append_log('Update the map before exporting.', 'warn')
+            return
         map_payload = self.state.original_map if kind == "original" else self.state.transformed_map
         figure_key = "original_map" if kind == "original" else "transformed_map"
         figure = self.state.figures.get(figure_key)

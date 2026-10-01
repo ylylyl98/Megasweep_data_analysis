@@ -3,16 +3,38 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from matplotlib import rcParams
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtWidgets import QFileDialog, QFrame, QLabel, QLineEdit, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFileDialog, QFrame, QLabel, QLineEdit, QSizePolicy, QToolButton, QVBoxLayout, QWidget
 from ui.exporting import save_figure
+
+
+class NumericLineEdit(QLineEdit):
+    """Size numeric fields by the active font instead of the available row width."""
+
+    def __init__(self, text='', parent=None):
+        super().__init__(text, parent)
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+
+    def sizeHint(self):
+        size = super().sizeHint()
+        size.setWidth(self.fontMetrics().horizontalAdvance('-1.23456789e-12') + 20)
+        return size
+
+    def minimumSizeHint(self):
+        size = super().minimumSizeHint()
+        size.setWidth(self.fontMetrics().horizontalAdvance('-1.234e-9') + 16)
+        return size
 
 
 class ExportNavigationToolbar(NavigationToolbar2QT):
     export_message = Signal(str, str)
 
     def save_figure(self, *args):
+        if not self.isEnabled() or not self.parent()._export_enabled:
+            self.export_message.emit('Plot is out of date. Update it before exporting.', 'warn')
+            return
         groups = self.canvas.get_supported_filetypes_grouped()
         filters = {f"{name} ({' '.join('*.' + ext for ext in extensions)})": extensions
                    for name, extensions in sorted(groups.items())}
@@ -40,7 +62,7 @@ class ProgressLabel(QLabel):
     def __init__(self):
         super().__init__("Working...")
         self.setVisible(False)
-        self.setStyleSheet("color:#5a7088; padding:4px 2px; font-weight:500;")
+        self.setProperty('fluentRole', 'caption')
 
 
 class CollapsibleSection(QFrame):
@@ -90,6 +112,7 @@ class PlotTab(QWidget):
         self.current_figure = None
         self.toolbar = None
         self.canvas = None
+        self._export_enabled = True
 
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -97,13 +120,12 @@ class PlotTab(QWidget):
 
         self.placeholder = QLabel(f"{title} preview will appear here.")
         self.placeholder.setAlignment(Qt.AlignCenter)
-        self.placeholder.setStyleSheet(
-            "color: #7b8da5; border: 1px dashed #cbd7e7; padding: 36px; "
-            "background: #f8fbff; border-radius: 12px;"
-        )
+        self.placeholder.setProperty('fluentRole', 'placeholder')
         self._layout.addWidget(self.placeholder)
 
     def set_figure(self, figure) -> None:
+        if self.current_figure is figure and self.canvas is not None:
+            return
         self.clear()
         self.current_figure = figure
         # A one-shot tight_layout leaves labels outside the canvas after resizing.
@@ -121,6 +143,12 @@ class PlotTab(QWidget):
         self._layout.addWidget(self.toolbar)
         self._layout.addWidget(self.canvas, 1)
         self.canvas.draw_idle()
+        self.set_export_enabled(self._export_enabled)
+
+    def set_export_enabled(self, enabled):
+        self._export_enabled = bool(enabled)
+        if self.toolbar is not None:
+            self.toolbar._actions['save_figure'].setEnabled(self._export_enabled)
 
     def clear(self) -> None:
         self.current_figure = None
@@ -129,6 +157,10 @@ class PlotTab(QWidget):
             self.toolbar.deleteLater()
             self.toolbar = None
         if self.canvas is not None:
+            # Cached figures outlive their Qt widgets. Keep hidden exports usable
+            # without retaining a renderer or a deleted C++ canvas.
+            if self.canvas.figure.canvas is self.canvas:
+                FigureCanvasAgg(self.canvas.figure)
             self._layout.removeWidget(self.canvas)
             self.canvas.deleteLater()
             self.canvas = None

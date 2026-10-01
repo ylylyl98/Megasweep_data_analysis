@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.map_display import WrapLayout
+from ui.styles import CAPTION_FONT_PX
 
 
 from ui.widgets import ProgressLabel, CollapsibleSection, PlotTab, CsvDropLineEdit
@@ -34,6 +35,7 @@ from ui.widgets import ProgressLabel, CollapsibleSection, PlotTab, CsvDropLineEd
 
 from ui.transport import TransportPanel
 from ui.spectral_slices import SpectralSlicesPanel
+from ui.auto_update import AutoUpdateControls
 
 class OpticalLayoutMixin:
     def _setup_ui(self) -> None:
@@ -47,7 +49,7 @@ class OpticalLayoutMixin:
 
         self.left_panel = QWidget()
         self.left_panel.setObjectName("SidebarPanel")
-        self.left_panel.setMinimumWidth(360)
+        self.left_panel.setMinimumWidth(368)
         self.left_panel.setMaximumWidth(620)
         self.left_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         left_panel_layout = QVBoxLayout(self.left_panel)
@@ -67,7 +69,7 @@ class OpticalLayoutMixin:
         left_layout.setSpacing(4)
 
         self.workflow_hint_label = QLabel(
-            "1. Load data  →  2. Choose analysis settings  →  3. Refresh a map"
+            "1. Load data  →  2. Choose analysis settings  →  3. View / Update Now"
         )
         self.workflow_hint_label.setWordWrap(True)
         self.workflow_hint_label.setStyleSheet(
@@ -126,12 +128,12 @@ class OpticalLayoutMixin:
         self.map_type_combo.addItems(
             ["Intensity", "Peak Energy", "Ibias", "Resistance"]
         )
-        self.map_type_combo.setFixedWidth(145)
+        self.map_type_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.map_type_combo.currentTextChanged.connect(self._on_map_selection_changed)
         map_row.addWidget(self._hrow(QLabel("Map Type"), self.map_type_combo))
         self.map_axes_combo = QComboBox()
         self.map_axes_combo.addItems(["Original", "Transformed"])
-        self.map_axes_combo.setFixedWidth(90)
+        self.map_axes_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.map_axes_combo.currentTextChanged.connect(self._on_map_selection_changed)
         map_row.addWidget(self._hrow(QLabel("Axes"), self.map_axes_combo))
         self.map_cmap_combo = QComboBox()
@@ -140,15 +142,15 @@ class OpticalLayoutMixin:
             "seismic", "coolwarm", "bwr", "Spectral_r", "RdYlBu_r",
         ])
         self.map_cmap_combo.setCurrentText("RdBu_r")
-        self.map_cmap_combo.setFixedWidth(90)
-        self.refresh_current_btn = QPushButton("Refresh Current")
-        self.refresh_current_btn.setProperty("class", "primary")
-        self.refresh_current_btn.clicked.connect(self._refresh_current_map_view)
+        self.map_cmap_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.map_updates = AutoUpdateControls(self._refresh_current_map_view, self._can_auto_map, delay=500, parent=self)
+        self.map_auto_update_check = self.map_updates.checkbox
+        self.refresh_current_btn = self.map_updates.button
         self.refresh_current_btn.style().unpolish(self.refresh_current_btn)
         self.refresh_current_btn.style().polish(self.refresh_current_btn)
         self.refresh_all_maps_btn = QPushButton("Refresh All Maps")
         self.refresh_all_maps_btn.clicked.connect(self._refresh_all_maps)
-        map_row.addWidget(self._hrow(self.refresh_current_btn, self.refresh_all_maps_btn))
+        map_row.addWidget(self._hrow(self.map_updates, self.refresh_all_maps_btn))
         map_controls_layout.addLayout(map_row)
 
         # ── Color scale row ───────────────────────────────────────────────
@@ -159,10 +161,10 @@ class OpticalLayoutMixin:
         self.map_auto_scale_check.setChecked(True)
         self.map_vmin_spin = self._dspin(-1e6, 1e6, 0.001, 4, 0.0)
         self.map_vmin_spin.setEnabled(False)
-        self.map_vmin_spin.setFixedWidth(96)
+        self.map_vmin_spin.setFixedWidth(self.map_vmin_spin.fontMetrics().horizontalAdvance('-1234567.1234') + 36)
         self.map_vmax_spin = self._dspin(-1e6, 1e6, 0.001, 4, 1.0)
         self.map_vmax_spin.setEnabled(False)
-        self.map_vmax_spin.setFixedWidth(96)
+        self.map_vmax_spin.setFixedWidth(self.map_vmax_spin.fontMetrics().horizontalAdvance('-1234567.1234') + 36)
         self.map_auto_scale_check.toggled.connect(
             lambda checked: (
                 self.map_vmin_spin.setEnabled(not checked),
@@ -236,7 +238,7 @@ class OpticalLayoutMixin:
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Consolas, Courier New, monospace", 9))
+        self.log_text.setFont(QFont("Consolas, Courier New, monospace", 10))
         self.log_text.setFixedHeight(140)
         self.log_text.hide()
         self.log_toggle = QPushButton("Log")
@@ -247,9 +249,9 @@ class OpticalLayoutMixin:
         self.batch_progress_bar = QProgressBar()
         self.batch_progress_bar.setVisible(False)
         self.batch_progress_bar.setTextVisible(True)
-        self.batch_progress_bar.setFixedHeight(16)
+        self.batch_progress_bar.setMinimumHeight(22)
         self.batch_progress_bar.setStyleSheet(
-            "QProgressBar { border:1px solid #4a4a4a; border-radius:3px; background:#1e1e1e; color:#e0e0e0; font-size:10px; }"
+            f"QProgressBar {{ border:1px solid #4a4a4a; border-radius:3px; background:#1e1e1e; color:#e0e0e0; font-size:{CAPTION_FONT_PX}px; }}"
             "QProgressBar::chunk { background:#3a6ea8; border-radius:2px; }"
         )
         log_layout.addWidget(self.progress_label)
@@ -327,7 +329,7 @@ class OpticalLayoutMixin:
         self.active_output_label.setMinimumWidth(0)
         self.active_output_label.setTextFormat(Qt.PlainText)
         self.active_output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.active_output_label.setStyleSheet("color:#5a7088; font-size:9px;")
+        self.active_output_label.setStyleSheet(f"color:#5a7088; font-size:{CAPTION_FONT_PX}px;")
         form.addRow("Saves to:", self.active_output_label)
 
         self.vbg_combo = QComboBox()
@@ -501,8 +503,11 @@ class OpticalLayoutMixin:
         self.estimate_background_scale_btn.clicked.connect(
             self._estimate_and_apply_background_scale
         )
-        self.preview_rc_btn = QPushButton("Preview One RC Frame")
-        self.preview_rc_btn.clicked.connect(self._preview_reflection_spectra)
+        self.preview_updates = AutoUpdateControls(lambda: self._preview_reflection_spectra(automatic=True),
+                                                 self._can_auto_preview, delay=300, parent=self,
+                                                 manual_callback=self._preview_reflection_spectra)
+        self.preview_auto_update_check = self.preview_updates.checkbox
+        self.preview_rc_btn = self.preview_updates.button
         self.preview_rc_btn.setToolTip(
             "Plot the RC spectrum for the nearest X/Y frame. Drag horizontally "
             "on the plot to set the peak window; the purple marker shows Fixed E."
@@ -530,7 +535,7 @@ class OpticalLayoutMixin:
 
         self.formula_label = QLabel(self._formula_text())
         self.formula_label.setWordWrap(True)
-        self.formula_label.setStyleSheet("color:#5a7088; font-size:9px;")
+        self.formula_label.setStyleSheet(f"color:#5a7088; font-size:{CAPTION_FONT_PX}px;")
 
         self.analysis_status_label = QLabel("Load a CSV to start.")
         self.analysis_status_label.setWordWrap(True)
@@ -598,7 +603,7 @@ class OpticalLayoutMixin:
         form.addRow(self.rc_preview_coordinates)
 
         self._rc_btn_placeholder = QLabel("")
-        form.addRow(self._rc_btn_placeholder, self.preview_rc_btn)
+        form.addRow(self.preview_updates)
 
         self._rc_status_row_label = QLabel("RC preview:")
         form.addRow(self._rc_status_row_label, self.reflection_preview_status_label)
@@ -615,7 +620,7 @@ class OpticalLayoutMixin:
             self.rc_preview_coordinates,
             self._rc_vbg_label, self.reflection_preview_vbg_spin,
             self._rc_vtg_label, self.reflection_preview_vtg_spin,
-            self._rc_btn_placeholder, self.preview_rc_btn,
+            self._rc_btn_placeholder, self.preview_updates,
             self._rc_status_row_label, self.reflection_preview_status_label,
         ]
         for w in self._rc_sidebar_widgets:
@@ -884,6 +889,7 @@ class OpticalLayoutMixin:
     @staticmethod
     def _dspin(lo: float, hi: float, step: float, decimals: int, value: float) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
+        spin.setKeyboardTracking(False)
         spin.setRange(lo, hi)
         spin.setSingleStep(step)
         spin.setDecimals(decimals)

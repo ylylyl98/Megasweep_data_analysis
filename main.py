@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use("qtagg")
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QIcon, QPalette, QColor
+from PySide6.QtGui import QIcon, QPalette
 from PySide6.QtCore import Qt
 
 # Ensure the app folder is on the path regardless of where Python is invoked from
@@ -79,21 +79,8 @@ def _apply_windows_app_id(app_id: str) -> None:
 
 def _light_palette() -> QPalette:
     """Return a light, modern-looking application palette."""
-    pal = QPalette()
-    pal.setColor(QPalette.Window, QColor(245, 247, 251))
-    pal.setColor(QPalette.WindowText, QColor(31, 41, 55))
-    pal.setColor(QPalette.Base, QColor(255, 255, 255))
-    pal.setColor(QPalette.AlternateBase, QColor(239, 244, 251))
-    pal.setColor(QPalette.ToolTipBase, QColor(255, 255, 255))
-    pal.setColor(QPalette.ToolTipText, QColor(31, 41, 55))
-    pal.setColor(QPalette.Text, QColor(31, 41, 55))
-    pal.setColor(QPalette.Button, QColor(255, 255, 255))
-    pal.setColor(QPalette.ButtonText, QColor(31, 41, 55))
-    pal.setColor(QPalette.BrightText, QColor(190, 24, 93))
-    pal.setColor(QPalette.Highlight, QColor(53, 102, 193))
-    pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-    pal.setColor(QPalette.PlaceholderText, QColor(113, 128, 150))
-    return pal
+    from ui.styles import theme_palette
+    return theme_palette('light')
 
 
 def main():
@@ -102,6 +89,10 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
+    # Native dialogs and menus also need the readable default used by the shell.
+    font = app.font()
+    font.setPointSizeF(max(10.5, font.pointSizeF()))
+    app.setFont(font)
     app.setStyle("Fusion")
     app.setPalette(_light_palette())
     if os.path.isfile(APP_ICON_PATH):

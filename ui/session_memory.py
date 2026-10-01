@@ -20,6 +20,7 @@ CONTROLS = (
     "scale_right_max_spin", "reflection_preview_vbg_spin", "reflection_preview_vtg_spin",
     "map_type_combo", "map_axes_combo", "map_cmap_combo", "map_auto_scale_check",
     "map_vmin_spin", "map_vmax_spin", "batch_epsilon_spin",
+    "map_auto_update_check", "preview_auto_update_check",
 )
 MAP_TASKS = {
     "original_map": "intensity_original", "transformed_map": "intensity_transformed",
@@ -77,7 +78,7 @@ class SessionMemoryMixin:
             self._session_save_timer.start()
 
     def _save_session(self):
-        if not self._session_ready or self._restoring_session or self._thread is not None:
+        if not self._session_ready or self._restoring_session:
             return
         self._remembered_views.update(MAP_TASKS[key] for key in self.state.figures if key in MAP_TASKS)
         self._remembered_lines |= bool(self.state.line_cut_results)
@@ -111,6 +112,7 @@ class SessionMemoryMixin:
             return False
         self._save_session()
         self._session_save_timer.stop()
+        self._cancel_auto_updates()
         self._session_ready = False
         self._axis_ranges = {}
         self._session_path = os.path.abspath(path)
@@ -275,4 +277,5 @@ class SessionMemoryMixin:
             return
         self._save_session()
         self._session_save_timer.stop()
+        self._stop_auto_updates()
         super().closeEvent(event)

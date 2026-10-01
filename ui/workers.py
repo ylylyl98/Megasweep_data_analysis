@@ -4,9 +4,11 @@ from spectral_processing import process_spectral_slice
 
 import os
 import traceback
+import threading
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
+from spectral_movie import MovieCancelled, MovieOptions, export_movie
 
 from megasweep_analysis import (
     build_map_payload,
@@ -20,11 +22,14 @@ from megasweep_analysis import (
     compute_transformed_coords,
     extract_line_cut,
     find_all_cut_values,
+    line_cut_axis_limits,
     load_megasweep_csv,
     load_spectral_csv,
     plot_line_cut_spectrogram,
     spectral_axes_match,
     spectral_slice_stem,
+    spectral_slice_title,
+    spectral_title_precision,
 )
 
 
@@ -430,39 +435,47 @@ class AnalysisRefreshWorker(BaseWorker):
         if not spectral_tasks:
             return payload
 
-        # Determine effective intensity matrix and map values based on mode
-        if self.mode == "Reflection":
+        peak_parameters = (self.mode, self.sg_window, self.sg_poly)
+        reference = self.background_spectra if self.mode == 'Reflection' else None
+        if self.mode == 'Reflection':
+            peak_parameters += (self.min_energy, self.max_energy,
+                                self.background_scale, self.rc_feature_mode)
+        cache_hit = (self.peak_cache.get('data') is self.data
+                     and self.peak_cache.get('background') is reference
+                     and self.peak_cache.get('parameters') == peak_parameters
+                     and 'values' in self.peak_cache)
+        intensity_tasks = {'intensity_original', 'intensity_transformed'} & tasks
+        fixed_tasks = {'fixed_original', 'fixed_transformed'} & tasks
+        peak_tasks = {'peak_original', 'peak_transformed'} & tasks
+        needs_spectra = intensity_tasks or fixed_tasks or (peak_tasks and not cache_hit)
+        working_intensity = self.data['Intensity']
+        if self.mode == "Reflection" and needs_spectra:
             self.log.emit("Computing RC spectra from the loaded background...")
             rc = _compute_reflection_spectra(
                 self.data,
                 self.background_spectra,
                 self.background_scale,
             )
-            intensity_flat = compute_rc_peak_to_peak_map(rc, self.data['energy'], self.min_energy, self.max_energy)
             working_intensity = rc  # for peak energy computation
-        else:
-            intensity_flat = compute_intensity_map(
-                self.data,
-                self.min_energy,
-                self.max_energy,
-                self.baseline,
-            )
-            working_intensity = self.data['Intensity']
 
-        original_map = build_map_payload(
-            self.data["x_data"],
-            self.data["y_data"],
-            intensity_flat,
-        )
-        if {"intensity_original", "intensity_transformed", "peak_original", "peak_transformed"} & tasks:
-            payload["original_map"] = original_map
-
-        transformed_map = None
         if {"intensity_transformed", "peak_transformed", "fixed_transformed"} & tasks:
             axis_space = self.data.get("axis_space", "gate")
+            if axis_space not in {'gate', 'transformed'}:
+                raise ValueError('D/E transformed views require BG/TG gate axes or loaded Doping/Efield axes. '
+                                 'Use the Original view for this sweep.')
+
+        if intensity_tasks:
+            intensity_flat = (compute_rc_peak_to_peak_map(working_intensity, self.data['energy'],
+                                self.min_energy, self.max_energy) if self.mode == 'Reflection'
+                              else compute_intensity_map(self.data, self.min_energy,
+                                                         self.max_energy, self.baseline))
+            if 'intensity_original' in tasks:
+                payload['original_map'] = build_map_payload(self.data['x_data'], self.data['y_data'], intensity_flat)
+
+        if "intensity_transformed" in tasks:
             if axis_space == "transformed":
                 self.log.emit("Loaded axes are already transformed; reusing them for transformed view...")
-                transformed_map = dict(original_map)
+                transformed_map = build_map_payload(self.data['x_data'], self.data['y_data'], intensity_flat)
                 transformed_map["already_transformed"] = True
             elif axis_space == "gate":
                 self.log.emit("Computing transformed coordinate view...")
@@ -473,15 +486,9 @@ class AnalysisRefreshWorker(BaseWorker):
                     self.tg_is_y,
                     self.convention,
                 )
-            else:
-                raise ValueError(
-                    "D/E transformed views require BG/TG gate axes or loaded "
-                    "Doping/Efield axes. Use the Original view for this sweep."
-                )
             transformed_map["ratio"] = self.ratio
             transformed_map["convention"] = self.convention
-            if "intensity_transformed" in tasks:
-                payload["transformed_map"] = transformed_map
+            payload["transformed_map"] = transformed_map
 
         if {"fixed_original", "fixed_transformed"} & tasks:
             if self.mode != "Reflection":
@@ -504,8 +511,6 @@ class AnalysisRefreshWorker(BaseWorker):
                 fixed_original["fixed_energy"] = self.fixed_energy
                 payload["fixed_map_original"] = fixed_original
             if "fixed_transformed" in tasks:
-                if transformed_map is None:
-                    raise ValueError("Transformed coordinates were not available for the fixed-energy map.")
                 if self.data.get("axis_space", "gate") == "transformed":
                     fixed_transformed = build_map_payload(
                         self.data["x_data"],
@@ -527,18 +532,6 @@ class AnalysisRefreshWorker(BaseWorker):
                 payload["fixed_map_transformed"] = fixed_transformed
 
         if {"peak_original", "peak_transformed"} & tasks:
-            peak_parameters = (self.mode, self.sg_window, self.sg_poly)
-            reference = None
-            if self.mode == "Reflection":
-                reference = self.background_spectra
-                peak_parameters += (self.min_energy, self.max_energy,
-                                    self.background_scale, self.rc_feature_mode)
-            cache_hit = (
-                self.peak_cache.get("data") is self.data
-                and self.peak_cache.get("background") is reference
-                and self.peak_cache.get("parameters") == peak_parameters
-                and "values" in self.peak_cache
-            )
             if cache_hit:
                 self.log.emit("Reusing cached spectral peak positions; rebuilding map coordinates...")
                 peak_flat = self.peak_cache["values"]
@@ -569,8 +562,6 @@ class AnalysisRefreshWorker(BaseWorker):
                 peak_original["target_axes"] = "original"
                 payload["peak_map_original"] = peak_original
             if "peak_transformed" in tasks:
-                if transformed_map is None:
-                    raise ValueError("Transformed coordinates were not available for the peak map.")
                 axis_space = self.data.get("axis_space", "gate")
                 if axis_space == "transformed":
                     peak_transformed = build_map_payload(
@@ -711,20 +702,6 @@ class LineWorker(BaseWorker):
         self.derivative_window = derivative_window
 
     def process(self) -> dict:
-        if self.background_spectra is not None:
-            self.log.emit("Computing RC spectra for line cuts...")
-            working_intensity = _compute_reflection_spectra(
-                self.data,
-                self.background_spectra,
-                self.background_scale,
-            )
-        else:
-            working_intensity = self.data["Intensity"]
-
-        raw_data = np.column_stack([
-            self.data["x_data"], self.data["y_data"], working_intensity
-        ])
-
         results = []
         for spec in self.specs:
             self.log.emit(
@@ -732,7 +709,7 @@ class LineWorker(BaseWorker):
                 f"(epsilon={spec['epsilon']:.4f})..."
             )
             line_cut = extract_line_cut(
-                raw_data,
+                None,
                 self.data["x_data"],
                 self.data["y_data"],
                 self.data["energy"],
@@ -746,7 +723,12 @@ class LineWorker(BaseWorker):
                 x_axis_name=self.data.get("x_name", ""),
                 y_axis_name=self.data.get("y_name", ""),
                 exact_coordinates=self.exact_coordinates,
+                spectra=self.data['Intensity'],
             )
+            if self.background_spectra is not None:
+                line_cut['spectra'] = _compute_reflection_spectra(
+                    dict(self.data, Intensity=line_cut['spectra']), self.background_spectra,
+                    self.background_scale)
             if self.spectral_processing is not None:
                 line_cut = process_spectral_slice(line_cut, self.spectral_processing,
                             self.derivative_window, is_rc=self.background_spectra is not None)
@@ -761,6 +743,82 @@ class LineWorker(BaseWorker):
                 self.log.emit(f"  → {n_pts} points selected")
 
         return {"line_cuts": results}
+
+
+class SpectralMovieWorker(LineWorker):
+    movie_progress = Signal(int, int, str)
+
+    def __init__(self, data, cut_type, values, destination, options, ranges, colors,
+                 metadata, ratio, epsilon, **kwargs):
+        super().__init__(data, [], ratio, **kwargs)
+        self.cut_type = cut_type
+        self.values = list(values)
+        self.destination = destination
+        self.options = MovieOptions(**options)
+        self.ranges, self.colors = ranges, colors
+        self.metadata = metadata
+        self.epsilon = epsilon
+        self.cancel = threading.Event()
+
+    def make_cut_factory(self):
+        if self.metadata.get('mode') == 'Reflection' and self.background_spectra is None:
+            raise ValueError('Load a matching background before preparing Reflection movies.')
+        data = self.data
+        intensity = (_compute_reflection_spectra(data, self.background_spectra, self.background_scale)
+                     if self.background_spectra is not None else data['Intensity'])
+        cut_type, ratio, epsilon = self.cut_type, self.ratio, self.epsilon
+        tg_is_y, convention = self.tg_is_y, self.convention
+        exact = self.exact_coordinates
+        processing, window = self.spectral_processing or 'spectrum', self.derivative_window
+        is_rc = self.background_spectra is not None
+        def get_cut(value):
+            cut = extract_line_cut(None, data['x_data'], data['y_data'], data['energy'],
+                   cut_type=cut_type, c_value=value, ratio=ratio, epsilon=epsilon,
+                   tg_is_y=tg_is_y, convention=convention,
+                   axis_space=data.get('axis_space', 'gate'),
+                   x_axis_name=data.get('x_name', ''), y_axis_name=data.get('y_name', ''),
+                   exact_coordinates=exact, spectra=intensity)
+            return process_spectral_slice(cut, processing, window, is_rc=is_rc)
+        return get_cut
+
+    def process(self):
+        try:
+            return export_movie(self.make_cut_factory(), self.values, self.destination,
+                                self.options, self.ranges, self.colors, self.metadata,
+                                self.movie_progress.emit, self.cancel)
+        except MovieCancelled:
+            self.log.emit('Movie export cancelled; temporary files removed.')
+            return dict(cancelled=True)
+
+
+class SpectralPreviewWorker(SpectralMovieWorker):
+    def __init__(self, *args, session=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.session = session
+
+    def process(self):
+        from spectral_preview import SpectralPreviewSession
+        try:
+            session = self.session or SpectralPreviewSession(self.make_cut_factory())
+            return session.prepare(self.values, self.options, self.ranges, self.colors,
+                                   self.movie_progress.emit, self.cancel)
+        except MovieCancelled:
+            return dict(cancelled=True)
+
+
+class SpectralPreviewFrameWorker(BaseWorker):
+    def __init__(self, request):
+        super().__init__()
+        self.request = request
+        self.cancel = threading.Event()
+
+    def process(self):
+        try:
+            image = self.request['session'].frame(self.request['value'], self.request['view'],
+                       MovieOptions(**self.request['options']), self.cancel)
+            return dict(image=image, value=self.request['value'], revision=self.request['revision'])
+        except MovieCancelled:
+            return dict(cancelled=True)
 
 
 class BatchLineWorker(BaseWorker):
@@ -778,6 +836,8 @@ class BatchLineWorker(BaseWorker):
         exact_coordinates: bool = False,
         spectral_processing: str | None = None,
         derivative_window: int = 9,
+        display_ranges: dict | None = None,
+        color_settings: dict | None = None,
     ):
         super().__init__()
         self.data = data
@@ -792,6 +852,8 @@ class BatchLineWorker(BaseWorker):
         self.exact_coordinates = exact_coordinates
         self.spectral_processing = spectral_processing
         self.derivative_window = derivative_window
+        self.display_ranges = display_ranges or {}
+        self.color_settings = color_settings or {}
 
     def process(self) -> dict:
         os.makedirs(self.output_dir, exist_ok=True)
@@ -807,10 +869,6 @@ class BatchLineWorker(BaseWorker):
         else:
             working_intensity = self.data["Intensity"]
             is_rc = False
-
-        raw_data = np.column_stack([
-            self.data["x_data"], self.data["y_data"], working_intensity
-        ])
 
         saved_files: list[str] = []
         total_cuts = 0
@@ -837,36 +895,20 @@ class BatchLineWorker(BaseWorker):
             self.log.emit(f"Found {len(cut_values)} {cut_type} line cuts to extract.")
             cut_type_values[cut_type] = cut_values
 
-        # Pass 1 — scan axis_values across every cut to get the global y range per type
+        # Coordinate-only bounds avoid extracting every spectral matrix twice.
         global_ylim: dict[str, tuple[float, float]] = {}
         for cut_type, cut_values in cut_type_values.items():
-            y_min, y_max = float("inf"), float("-inf")
-            for c_value in cut_values:
-                lc = extract_line_cut(
-                    raw_data,
-                    self.data["x_data"],
-                    self.data["y_data"],
-                    self.data["energy"],
-                    cut_type=cut_type,
-                    c_value=c_value,
-                    ratio=self.ratio,
-                    epsilon=self.epsilon,
-                    tg_is_y=self.tg_is_y,
-                    convention=self.convention,
-                    axis_space=self.data.get("axis_space", "gate"),
-                    x_axis_name=self.data.get("x_name", ""),
-                    y_axis_name=self.data.get("y_name", ""),
-                    exact_coordinates=self.exact_coordinates,
-                )
-                av = lc["axis_values"]
-                if len(av):
-                    y_min = min(y_min, float(np.min(av)))
-                    y_max = max(y_max, float(np.max(av)))
-            if y_min < y_max:
-                global_ylim[cut_type] = (y_min, y_max)
+            limits = line_cut_axis_limits(self.data['x_data'], self.data['y_data'], cut_type,
+                       cut_values, self.ratio, self.epsilon, self.tg_is_y, self.convention,
+                       self.data.get('axis_space', 'gate'), self.data.get('x_name', ''),
+                       self.data.get('y_name', ''), self.exact_coordinates)
+            if limits is not None:
+                global_ylim[cut_type] = limits
+                y_min, y_max = limits
                 self.log.emit(f"  {cut_type} y range: [{y_min:.3f}, {y_max:.3f}]")
 
-        # Pass 2 — extract, save CSV, and plot using the shared y range
+        # Extract each cut once, save full-range CSV and draw the shared view.
+        title_precisions = {kind: spectral_title_precision(values) for kind, values in cut_type_values.items()}
         work_items: list[tuple[str, float]] = [
             (ct, cv) for ct, cvs in cut_type_values.items() for cv in cvs
         ]
@@ -878,7 +920,7 @@ class BatchLineWorker(BaseWorker):
             os.makedirs(subfolder, exist_ok=True)
 
             line_cut = extract_line_cut(
-                raw_data,
+                None,
                 self.data["x_data"],
                 self.data["y_data"],
                 self.data["energy"],
@@ -892,6 +934,7 @@ class BatchLineWorker(BaseWorker):
                 x_axis_name=self.data.get("x_name", ""),
                 y_axis_name=self.data.get("y_name", ""),
                 exact_coordinates=self.exact_coordinates,
+                spectra=working_intensity,
             )
 
             self.progress.emit(done, total_work)
@@ -922,11 +965,20 @@ class BatchLineWorker(BaseWorker):
                     cmap = "RdBu_r"
                 fig, _ = plot_line_cut_spectrogram(
                     line_cut,
-                    title=f"{line_cut.get('fixed_axis_label', cut_type)} = {c_value:.12g}",
+                    title=spectral_slice_title(line_cut, title_precisions[cut_type]),
                     cmap=cmap,
                     z_label=z_label,
                     ylim=global_ylim.get(cut_type),
+                    vmin=self.color_settings.get('min') if not self.color_settings.get('auto', True) else None,
+                    vmax=self.color_settings.get('max') if not self.color_settings.get('auto', True) else None,
                 )
+                axes = fig.axes[0]
+                for axis, spec in self.display_ranges.get(cut_type, {}).items():
+                    if axis in {'x', 'y'} and not spec.get('auto', True):
+                        low, high = float(spec['min']), float(spec['max'])
+                        if not np.isfinite(low) or not np.isfinite(high) or low >= high:
+                            raise ValueError('Batch display range requires finite Min < Max.')
+                        getattr(axes, f'set_{axis}lim')(low, high)
                 png_path = os.path.join(subfolder, f"{stem}.png")
                 exported = save_figure(fig, png_path)
                 saved_files.append(str(exported.path))

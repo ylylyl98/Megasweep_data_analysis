@@ -2,19 +2,21 @@
 import math
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QLineEdit, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QComboBox
+from ui.widgets import NumericLineEdit
 
 
 class PlotRangeControls(QWidget):
     changed = Signal()
 
-    def __init__(self, *, title='Display range'):
+    def __init__(self, *, title='Display range', show_mode_selector=False):
         super().__init__()
         self._figure = None
         self._full_limits = {}
         self._ranges = {}
         self._syncing = False
         self.controls, self.labels = {}, {}
+        self.modes = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -24,32 +26,46 @@ class PlotRangeControls(QWidget):
             row.setSpacing(4)
             label, auto = QLabel(axis.upper()), QCheckBox('Auto')
             auto.setChecked(True)
-            lower, upper = QLineEdit('0'), QLineEdit('1')
+            lower, upper = NumericLineEdit('0'), NumericLineEdit('1')
             row.addWidget(label)
-            row.addWidget(auto)
+            if show_mode_selector:
+                mode = QComboBox()
+                mode.addItem('Auto', True)
+                mode.addItem('Fixed', False)
+                mode.setAccessibleName(f'{axis.upper()} range mode')
+                mode.setToolTip('Auto: use the full coordinate range. Fixed: keep Min/Max across slices and exports.')
+                row.addWidget(mode)
+                self.modes[axis] = mode
+                # Keep the established boolean control/recipe interface for
+                # existing callers; the visible selector makes both modes clear.
+                auto.setParent(self)
+                auto.hide()
+                mode.currentIndexChanged.connect(lambda _index, a=axis: self._mode_changed(a))
+            else:
+                row.addWidget(auto)
             for name, edit in (('Min', lower), ('Max', upper)):
                 caption = QLabel(name)
                 caption.setBuddy(edit)
                 edit.setAccessibleName(f'{axis.upper()} range {name}')
                 edit.setToolTip('Display only. Scientific notation is accepted, e.g. -2e-9.')
-                edit.setMinimumWidth(45)
-                edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
                 row.addWidget(caption)
-                row.addWidget(edit, 1)
+                row.addWidget(edit)
                 edit.editingFinished.connect(lambda a=axis: self._edited(a))
+            row.addStretch(1)
             auto.toggled.connect(lambda checked, a=axis: self._edited(a))
             layout.addLayout(row)
             self.controls[axis] = auto, lower, upper
             self.labels[axis] = label
         self.error = QLabel()
         self.error.setWordWrap(True)
-        self.error.setStyleSheet('color:#b91c1c;')
+        self.error.setProperty('fluentSeverity', 'danger')
         layout.addWidget(self.error)
         self.reset()
 
     def reset(self):
         self._figure = None
         self._full_limits = {}
+        self._fixed_limits = {}
         self._ranges = {a: {'auto': True, 'min': 0.0, 'max': 1.0} for a in ('x', 'y')}
         self.error.clear()
         self.error.hide()
@@ -58,7 +74,11 @@ class PlotRangeControls(QWidget):
         self._sync()
 
     def recipe(self):
-        return {axis: dict(spec) for axis, spec in self._ranges.items()}
+        result = {axis: dict(spec) for axis, spec in self._ranges.items()}
+        for axis, limits in self._fixed_limits.items():
+            if result[axis]['auto']:
+                result[axis].update(fixed_min=limits[0], fixed_max=limits[1])
+        return result
 
     def restore(self, value):
         self.reset()
@@ -73,6 +93,15 @@ class PlotRangeControls(QWidget):
                     continue
                 if math.isfinite(low) and math.isfinite(high) and low < high:
                     self._ranges[axis] = {'auto': spec['auto'], 'min': low, 'max': high}
+                    if not spec['auto']:
+                        self._fixed_limits[axis] = (low, high)
+                    else:
+                        try:
+                            saved = float(spec['fixed_min']), float(spec['fixed_max'])
+                            if all(math.isfinite(v) for v in saved) and saved[0] < saved[1]:
+                                self._fixed_limits[axis] = saved
+                        except (KeyError, TypeError, ValueError, OverflowError):
+                            pass
         self._sync()
 
     def attach(self, figure):
@@ -83,6 +112,14 @@ class PlotRangeControls(QWidget):
         self._full_limits = {a: getattr(axes, f'get_{a}lim')() for a in ('x', 'y')}
         for axis in ('x', 'y'):
             self.labels[axis].setToolTip(f'{axis.upper()}: {getattr(axes, f"get_{axis}label")()}')
+        self._apply()
+        self._sync()
+
+    def set_full_limits(self, limits):
+        """Provide Auto bounds for controls without an attached plot."""
+        self._full_limits = {axis: tuple(bounds) for axis, bounds in limits.items()
+                             if axis in self.controls and len(bounds) == 2
+                             and all(math.isfinite(v) for v in bounds) and bounds[0] < bounds[1]}
         self._apply()
         self._sync()
 
@@ -108,9 +145,18 @@ class PlotRangeControls(QWidget):
         self.error.clear()
         self.error.hide()
         self._ranges[axis] = {'auto': auto.isChecked(), 'min': low, 'max': high}
+        if not auto.isChecked():
+            self._fixed_limits[axis] = (low, high)
         self._apply()
         self._sync()
         self.changed.emit()
+
+    def _mode_changed(self, axis):
+        if not self._syncing:
+            if not self.modes[axis].currentData() and axis in self._fixed_limits:
+                for edit, value in zip(self.controls[axis][1:], self._fixed_limits[axis]):
+                    edit.setText(f'{value:.12g}')
+            self.controls[axis][0].setChecked(self.modes[axis].currentData())
 
     def _apply(self):
         if self._figure is None:
@@ -127,6 +173,9 @@ class PlotRangeControls(QWidget):
             for axis, spec in self._ranges.items():
                 auto, lower, upper = self.controls[axis]
                 auto.setChecked(spec['auto'])
+                if axis in self.modes:
+                    mode = self.modes[axis]
+                    mode.setCurrentIndex(mode.findData(spec['auto']))
                 limits = self._full_limits.get(axis, (spec['min'], spec['max'])) if spec['auto'] else (spec['min'], spec['max'])
                 for edit, value in zip((lower, upper), limits):
                     edit.setText(f'{value:.12g}')

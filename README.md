@@ -4,14 +4,32 @@
 
 Megasweep Analysis is a Python desktop application for analyzing megasweep photoluminescence (PL), reflection contrast, and scalar transport CSV data. It supports map views, spectral or scalar line cuts, and result exports. The optical workflow also transforms gate axes into doping/efield coordinates.
 
+The native Qt interface uses shared semantic Fluent-inspired colors, readable
+forms, consistent focus states, and a compact Advanced disclosure for MP4
+timing/encoding settings. Light/dark styles share the same template; the app
+continues to start in light mode. Color provenance is recorded in
+`ui/fluent_tokens.json`; keep it and `ui/icons` with the application sources.
+
 ## Spectral slices (PL and Reflection)
+
+Plot pages provide **Auto Update** (on by default) and **Update Now**. Parameter
+changes are combined over 300 ms (500 ms for optical maps); numeric fields
+commit on Enter or focus loss. Only the selected plot page in the active
+measurement workspace calculates automatically. Optical calculations run in
+the existing background worker; pending edits resume after it finishes, and
+outdated worker results are discarded. The previous plot stays visible while
+out of date, with sidebar and toolbar export disabled until the update succeeds.
+Turn Auto Update off to apply several edits together with Update Now. Choices
+are remembered per CSV. Color and display-range controls still apply immediately.
+Loading CSVs, Refresh All Maps, batch exports, movie preparation and MP4 encoding
+remain explicit actions; automatic plot updates do not reread a growing CSV.
 
 Both optical workspaces use **Spectral Slices** for optical slices, including
 D/E slices. It replaces the old optical Line Cuts sidebar section and tab;
 Transport keeps its separate one-dimensional Line Cut view.
 Choose **Follow map** (default), **Original X/Y**, or
 **Transformed D/E**, then choose the fixed axis and a measured value.
-**Extract Slice** displays energy horizontally and the other sweep coordinate
+**Update Now** displays energy horizontally and the other sweep coordinate
 vertically. Color shows raw PL intensity, or RC using the current background
 and background scale. Reflection requires a matching background; PL does not.
 
@@ -23,21 +41,37 @@ Saved legacy line-cut recipes remain readable. At least two distinct varying-axi
 points are required for a 2D spectral slice. A transformed map refresh is not
 required before extracting from loaded spectra.
 
-**Preview Counts**, **All fixed X**, **All fixed Y**, and **All Both** support
-batch export (X/Y refer to the selected coordinate system). **Save CSV/PNG**
+**Preview Counts**, **All fixed [axis name]**, and **All fixed axes** support
+batch export. Button labels follow the actual loaded axes or selected D/E
+coordinates, and long labels wrap onto another button row. **Save CSV/PNG**
 exports the displayed slice. Outputs go under the dataset results folder in
 `spectral_slices/pl` or `spectral_slices/reflection`; existing exports are
 preserved. Original-axis CSVs retain the full varying-axis label and a fixed
 coordinate column. Slice controls are remembered per CSV and workspace; click
-Extract Slice to regenerate the preview after reloading.
+Update Now to regenerate the preview after reloading, or select the slice page
+with Auto Update enabled.
 
 The fixed-value field names the actual coordinate being held constant.
-**Display range** provides independent **Auto / Min / Max** for X (energy in eV)
-and Y (the varying sweep coordinate). **Color scale** provides **Auto / V min /
+Use the left/right arrow buttons beside it to step through measured fixed values,
+including irregularly spaced sweeps. Buttons stop at the first/last value. When a
+slice is displayed, stepping automatically refreshes it while retaining the
+current processing, coordinate limits, and color limits. Typing and dropdown
+selection remain available.
+**Display range** provides **Full (Auto) / Zoom (Fixed)** for X (energy in eV)
+and **Auto / Fixed** for Y (the varying sweep coordinate). X Full uses all
+measured energy channels; Zoom remembers the last valid Min/Max, including
+across Full/Zoom switches and saved sessions. Y Auto uses one whole-sweep range
+for every slice. These main-page ranges apply while stepping between slices and
+exporting PNG. MP4 has its own independent range controls. Range changes update the existing
+plot without extracting spectra again; CSV always retains all points.
+**Color scale** provides **Auto / V min /
 V max** in the plotted signal's units. Scientific notation is accepted. Valid
 changes update the preview and **Save PNG** immediately, without re-extraction;
 invalid ranges retain the previous display. CSV exports retain every extracted
-point, and batch plots use their full ranges. View settings are remembered with
+point. Batch PNGs inherit the energy range and manual color limits; the manual
+varying-axis range applies to the currently selected fixed-axis series. When
+exporting both axis series, the other series uses its own shared automatic
+varying-axis range. View settings are remembered with
 the file; changing axes resets coordinate limits, and changing signal processing
 resets color limits.
 
@@ -50,6 +84,87 @@ strongly; the endpoints use one-sided windows. The source spectra are preserved.
 Single and batch derivative exports use a `_d2dE2_wN` filename suffix, and CSVs
 record processing, window size, and signal units.
 
+Slice plots share larger default text sizes: titles 16 pt, axis/colorbar labels
+14 pt, and ticks 12 pt. These defaults apply to preview, single/batch PNGs, and
+movie frames (scaled with output resolution), without additional font controls.
+Titles use compact D/E names for those coordinates and up to six significant
+digits without trailing zeros (`-0.010000` displays as `-0.01`). Precision
+increases automatically when needed to distinguish measured setpoints. Display
+formatting never rounds the data or the coordinate values saved in CSV/JSON.
+Titles show only the fixed coordinate. The colorbar identifies the displayed
+signal/derivative and units; derivative window size remains in the processing
+controls, export filenames, CSV columns and movie settings JSON.
+
+**Create MP4…** becomes available after extracting a slice. Each movie frame
+uses the Megasweep slice plot, while the fixed measured coordinate changes.
+Choose inclusive first/last coordinates and a measured-coordinate stride, then
+review the selected values and estimated duration. Playback supports forward,
+reverse, forward-and-back, speed, repetitions, and independent extra start/end
+holds per repetition. Defaults are 0.25 seconds per slice, 30 fps, forward once,
+1400 × 960 pixels and CRF 18. Slice hold and video fps are independent; no
+interpolated measurements are generated. Final export streams frames directly
+to the encoder.
+Timing, speed, direction, repetitions, resolution and CRF live under a collapsed
+**Advanced** section. Expanding/collapsing it does not reset saved settings.
+For PowerPoint, save a few representative slices with **Save PNG** and use one
+MP4 for the complete sequence; **All fixed…** remains available for full archiving.
+
+The MP4 window puts settings on the left and an embedded preview on the right.
+It immediately shows the current slice. **Preview** directly plays rendered
+slice images, with no video encoding or temporary MP4. Shared ranges/colors are
+prepared once, cuts/statistics are cached, and additional frames render on demand
+in the background. Pause, restart or drag the playback slider. Hold, speed,
+direction, fps, endpoint holds and repetitions update playback immediately;
+CRF affects only export. Changing colors or measured selection requires clicking
+**Preview** again and reuses calculated statistics. Preparation can be cancelled
+without closing settings. Preview frames preserve the export aspect ratio and
+plot style with a maximum 960-pixel long edge; numerical-cut and image caches
+are bounded to 64 MiB and 32 MiB. A temporary PNG cache (up to 512 MiB) keeps
+rendered images for replay and seeking even after memory eviction; closing the
+window removes it. Playback waits for missing images and visits each slice in
+order, so the first pass can take longer than the indicated movie duration.
+**Export MP4** alone encodes and validates the video, using the chosen full
+resolution and CRF. Enter commits parameter edits without exporting; activate
+**Export MP4** explicitly. Preview creates no result files.
+
+MP4 export also keeps a bounded 64 MiB numeric-cut cache between color-range
+preparation and rendering. For repeated or ping-pong playback, full-resolution
+frames use a temporary PNG cache of at most 512 MiB; completing, cancelling or
+failing the export removes this cache. A single pass does not write frame PNGs.
+Preview and export use separate caches because their output dimensions differ.
+Batch extraction resolves shared Y bounds from coordinates and extracts each
+spectral matrix once. Single RC slices and RC previews correct only selected rows.
+
+The MP4 window provides independent X Full/Zoom and Y Auto/Fixed controls near
+the slice selection. First use starts with the current PNG ranges; later openings
+remember the movie's own settings, including after closing without exporting.
+Changing movie ranges leaves PNG controls and CSV data unchanged. Automatic
+coordinate ranges use the whole source sweep, including for movie subsets.
+Color scale
+offers **Global auto** (default, finite visible min/max across all selected
+slices), **Manual fixed**, or **Per-frame auto**. Automatic derivative color
+limits are symmetric around zero. Per-frame colors emphasize local structure
+and cannot be compared as absolute intensity between slices. Movie settings do
+not change single-slice processing or color controls. Empty slices or slices
+with no finite visible signal are skipped and reported in the Log and sidecar;
+the final duration reflects the slices actually included.
+
+The background export task has an independent **Cancel** dialog. Silent MP4s
+use H.264/yuv420p with even pixel dimensions and a white background. Encoding
+and a full decode check must succeed before publishing; cancellation/failure
+cleans temporary files. Outputs go into `spectral_slices/pl/movies` or
+`spectral_slices/reflection/movies`, with a matching `.settings.json` recording
+source paths, actual coordinate sequence, processing/background settings, view
+limits, playback options and duration. Existing MP4s and sidecars are preserved
+with numbered names. Settings are remembered per dataset/workspace; restoring
+a session never exports a movie automatically. FFmpeg is supplied by
+`imageio-ffmpeg`, or an installed `ffmpeg`/local `ffmpeg.exe`.
+
+Already transformed Doping/Efield CSVs use their actual X/Y labels in the same
+slice controls, without a duplicate coordinate selector. Raw BG/TG CSVs retain
+Original X/Y and Transformed D/E options. The old optical Line Cuts controls
+remain hidden as a legacy-recipe compatibility adapter.
+
 ## Transport CSVs
 
 Open the **Transport** tab and load a CSV. The optional second row
@@ -59,11 +174,13 @@ No optical spectrum or reflection background is required.
 1. Review the **suggested axes** and choose **Signal** from the actual numeric CSV
    headers. There is no hardcoded Doping/Vds/Ids_X default. Unit labels appear beside
    column names. All-empty columns are excluded; pass/direction are separate filters.
-2. Select a direction and/or pass if needed, then click **Refresh Plot**. Snake
+2. Select a direction and/or pass if needed. Auto Update redraws valid selections;
+   with automatic updates off, click **Update Now**. Snake
    scans are arranged by their coordinate values. Duplicate coordinate pairs
    require different coordinates or a pass/direction filter; they are never averaged.
 3. In **Line Cut**, choose the fixed coordinate column and one of its measured
-   values, then click **Plot Cut**. Either map coordinate can be fixed.
+   values. The cut updates automatically; with automatic updates off, click
+   **Update Now**. Either map coordinate can be fixed.
 4. Use **Save Map/Cut PNG/CSV**. CSV exports contain the selected measured rows
    with all original columns, including pass/direction; the units row is omitted
    so exported values remain directly readable as numbers. PNG maps use the
@@ -173,7 +290,11 @@ and Original/Transformed views remember separate ranges for each CSV. PNG export
 uses the visible range; CSV export keeps the complete measured data. Colormap
 and color-scale edits update the current plot immediately without recalculation.
 
-Map refreshes reuse valid numerical results when only display settings change.
+Map refreshes reuse valid numerical results, figures and the visible canvas when
+only display settings change. Transport color changes update the existing mesh
+and colorbar. Peak/fixed-energy refreshes calculate only the requested quantity;
+they do not also build intensity maps. Slice-coordinate lists are reused until
+the dataset or coordinate/tolerance settings change.
 Peak positions are also reused when changing the coordinate transform or ratio;
 only the map grid is rebuilt. Changes to the data, reference spectrum, or relevant
 peak-analysis parameters invalidate the cached result. These numerical caches
@@ -230,6 +351,7 @@ restarting the updated app.
   - `matplotlib`
   - `Pillow`
   - `scipy`
+  - `imageio-ffmpeg` (MP4 encoding)
 - A megasweep CSV file with selectable sweep-axis columns and numeric spectral column headers.
 - For Reflection mode: one or more matching background CSV files with the same spectral channels as the primary data.
 
@@ -291,7 +413,8 @@ Basic workflow:
 4. Click `Load CSV`.
 5. Configure the six-decimal energy window, optional fixed RC energy, baseline, ratio, transform convention, and Savitzky-Golay settings.
 6. In Reflection mode, select one or more background CSV files and click `Load Background`.
-7. Use `Refresh Current View` or `Refresh All Maps` to generate map views.
+7. The current map updates automatically. Use `Update Now` in manual mode, or
+   `Refresh All Maps` to explicitly calculate every map view.
 8. Configure line cuts and click `Extract Line Cuts`, or use batch extraction for all doping/efield cuts.
 9. Export generated maps and line cuts as PNG or CSV files.
 

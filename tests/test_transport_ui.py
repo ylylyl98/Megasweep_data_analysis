@@ -166,7 +166,8 @@ class TransportUiTests(unittest.TestCase):
         panel.suggest_button.click()
         self.assertEqual(panel.x_combo.currentData(), 'Bias')
         self.assertEqual(panel.y_combo.currentData(), 'Field')
-        self.assertIsNone(panel.result)
+        self.assertFalse(panel.export_buttons[('map', 'csv')].isEnabled())
+        self.assertIsNotNone(panel.map_plot.current_figure)
 
     def test_single_coordinate_curve_plot_export_and_restore(self):
         self.csv.write_text('Bias,Current,PassIndex,FastDirection\nV,A,#,\n'

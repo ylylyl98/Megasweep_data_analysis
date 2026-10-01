@@ -115,7 +115,10 @@ class ReflectionWorkflowMixin:
             "fixed_transformed",
             "line_cuts",
         )
-        self.line_plot_tab.clear()
+        if self._reflection_preview_message is None:
+            self.line_plot_tab.clear()
+        else:
+            self._request_preview_update()
 
 
     def _on_background_scale_enabled_changed(self, enabled: bool) -> None:
@@ -219,7 +222,7 @@ class ReflectionWorkflowMixin:
                         "warn",
                     )
             if refresh_preview and self._reflection_preview_message is not None:
-                self._preview_reflection_spectra()
+                self._request_preview_update()
             self._show_current_map_view()
             self._refresh_stage_states()
             return True
@@ -237,6 +240,7 @@ class ReflectionWorkflowMixin:
 
     def _clear_reflection_preview(self) -> None:
         self._reflection_preview_message = None
+        self._preview_stale = True
         self._rc_span_selector = None
         if self.state.figures.get("line_cuts") is None:
             self.line_plot_tab.clear()
@@ -458,7 +462,8 @@ class ReflectionWorkflowMixin:
         )
 
 
-    def _preview_reflection_spectra(self) -> None:
+    def _preview_reflection_spectra(self, *, automatic=False) -> None:
+        self.preview_updates.cancel()
         if self.state.mode != "Reflection":
             self._append_log("RC spectra preview is only available in Reflection mode.", "warn")
             return
@@ -472,16 +477,16 @@ class ReflectionWorkflowMixin:
             from scipy.signal import savgol_filter as _sgf
             from megasweep_analysis import compute_rc_peak_position as _rc_peak_pos
 
+            if self.state.data['Intensity'].shape[0] == 0:
+                raise ValueError("No reflection points are available for RC preview.")
+            row_index, actual_x, actual_y = self._selected_reflection_frame()
             rc_spectra = compute_rc_spectra(
-                self.state.data["Intensity"],
+                self.state.data["Intensity"][row_index:row_index + 1],
                 self.state.background_spectra,
                 background_scale=self._effective_background_scale(),
             )
             energy = np.asarray(self.state.data["energy"], dtype=float).reshape(-1)
-            if rc_spectra.shape[0] == 0:
-                raise ValueError("No reflection points are available for RC preview.")
-            row_index, actual_x, actual_y = self._selected_reflection_frame()
-            spectrum = np.asarray(rc_spectra[row_index], dtype=float).reshape(-1)
+            spectrum = np.asarray(rc_spectra[0], dtype=float).reshape(-1)
             self._refresh_raw_background_plot(row_index, actual_x, actual_y)
         except Exception:
             self._append_log(traceback.format_exc(), "error")
@@ -618,7 +623,10 @@ class ReflectionWorkflowMixin:
             minspan=1e-6,
             interactive=True,
         )
-        self.workspace_tabs.setCurrentIndex(1)
+        self._preview_stale = False
+        self.line_plot_tab.set_export_enabled(True)
+        if not automatic:
+            self.workspace_tabs.setCurrentIndex(1)
 
         p2p_str = f"{rc_p2p:.4f}" if np.isfinite(rc_p2p) else "n/a"
         pk_str = f"{pk_energy:.4f} eV" if np.isfinite(pk_energy) else "n/a"

@@ -5,7 +5,7 @@ import traceback
 import numpy as np
 from matplotlib.figure import Figure
 
-from megasweep_analysis import plot_line_cut_spectrogram, plot_map
+from megasweep_analysis import plot_line_cut_spectrogram, plot_map, update_map_colors
 
 
 from ui.widgets import PlotTab
@@ -97,7 +97,8 @@ class PlotResultsMixin:
     def _show_current_map_view(self) -> None:
         figure = self._current_map_figure()
         if figure is None:
-            self.map_plot_tab.clear()
+            if self.state.data is None:
+                self.map_plot_tab.clear()
         else:
             if hasattr(self, "_axis_ranges"):
                 self._apply_axis_ranges(figure, self.map_axes_combo.currentText())
@@ -114,6 +115,8 @@ class PlotResultsMixin:
             vmin_val = None if self.map_auto_scale_check.isChecked() else self.map_vmin_spin.value()
             vmax_val = None if self.map_auto_scale_check.isChecked() else self.map_vmax_spin.value()
             is_rc = self.state.mode == "Reflection"
+            previous_maps = {key: getattr(self.state, attribute)
+                             for attribute, key in self._MAP_CACHE_FIELDS.values()}
             for map_key, map_data in payload.items():
                 if map_key not in [
                     "original_map",
@@ -272,17 +275,27 @@ class PlotResultsMixin:
                     map_data["z_name"] = z_name
                     map_data["target_axes"] = target_axes
 
-                    # Render figure
-                    fig, _ = plot_map(
-                        map_data["X2D"], map_data["Y2D"], map_data["Z2D"],
-                        x_label=x_name, y_label=y_name, z_label=z_label,
-                        title=title,
-                        cmap=cmap,
-                        vmin=vmin_val,
-                        vmax=vmax_val,
-                    )
+                    fig = self.state.figures.get(figure_key)
+                    changed = False
+                    if fig is not None and previous_maps.get(map_key) is map_data:
+                        for axes, field, text in ((fig.axes[0], 'title', title), (fig.axes[0], 'xlabel', x_name),
+                                                  (fig.axes[0], 'ylabel', y_name), (fig.axes[1], 'ylabel', z_label)):
+                            if getattr(axes, f'get_{field}')() != text:
+                                getattr(axes, f'set_{field}')(text)
+                                changed = True
+                        changed |= update_map_colors(fig, map_data['Z2D'], cmap, vmin_val, vmax_val)
+                    else:
+                        fig, _ = plot_map(
+                            map_data["X2D"], map_data["Y2D"], map_data["Z2D"],
+                            x_label=x_name, y_label=y_name, z_label=z_label,
+                            title=title, cmap=cmap, vmin=vmin_val, vmax=vmax_val,
+                        )
                     self.state.figures[figure_key] = fig
+                    previous_limits = (fig.axes[0].get_xlim(), fig.axes[0].get_ylim())
                     self._apply_axis_ranges(fig, "Original" if target_axes == "original" else "Transformed")
+                    changed |= previous_limits != (fig.axes[0].get_xlim(), fig.axes[0].get_ylim())
+                    if changed and self.map_plot_tab.current_figure is fig:
+                        self.map_plot_tab.canvas.draw_idle()
                     self._log_map_payload(z_name, map_data, x_name, y_name)
 
                 except Exception:

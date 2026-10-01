@@ -3,7 +3,8 @@ import math
 
 from matplotlib.colors import Normalize
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from ui.widgets import NumericLineEdit
 
 
 class ColorScaleControls(QWidget):
@@ -21,20 +22,21 @@ class ColorScaleControls(QWidget):
         row.addWidget(QLabel('3. Color scale'))
         self.auto = QCheckBox('Auto')
         row.addWidget(self.auto)
-        self.lower, self.upper = QLineEdit(), QLineEdit()
+        self.lower, self.upper = NumericLineEdit(), NumericLineEdit()
         for name, edit in (('V min', self.lower), ('V max', self.upper)):
             label = QLabel(name)
             label.setBuddy(edit)
             edit.setAccessibleName(f'Color {name}')
             edit.setToolTip('Color-bar limit in the plotted signal units. Scientific notation is accepted.')
             row.addWidget(label)
-            row.addWidget(edit, 1)
+            row.addWidget(edit)
             edit.editingFinished.connect(self._edited)
+        row.addStretch(1)
         self.auto.toggled.connect(self._edited)
         layout.addLayout(row)
         self.error = QLabel()
         self.error.setWordWrap(True)
-        self.error.setStyleSheet('color:#b91c1c;')
+        self.error.setProperty('fluentSeverity', 'danger')
         layout.addWidget(self.error)
         self.reset()
 

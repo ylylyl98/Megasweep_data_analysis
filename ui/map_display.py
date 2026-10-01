@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import math
-import numpy as np
-from matplotlib import colormaps
+from megasweep_analysis import update_map_colors
 from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QLayout, QSizePolicy, QWidget
 
@@ -173,24 +172,14 @@ class MapDisplayMixin:
         payload = self._current_map_payload()
         if figure is None or payload is None:
             return
-        if self.map_auto_scale_check.isChecked():
-            finite = np.asarray(payload["Z2D"])
-            finite = finite[np.isfinite(finite)]
-            if not finite.size:
-                return
-            lower, upper = float(finite.min()), float(finite.max())
-        else:
+        lower, upper = None, None
+        if manual:
             lower, upper = self.map_vmin_spin.value(), self.map_vmax_spin.value()
             if lower >= upper:
                 self.map_status_label.setText("Color range: Min must be less than Max; previous range kept.")
                 return
-        for artist in [*figure.axes[0].collections, *figure.axes[0].images]:
-            cmap = colormaps[self.map_cmap_combo.currentText()].with_extremes(
-                bad=artist.get_cmap().get_bad()
-            )
-            artist.set_cmap(cmap)
-            artist.set_clim(lower, upper)
-        figure.canvas.draw_idle()
+        if update_map_colors(figure, payload['Z2D'], self.map_cmap_combo.currentText(), lower, upper):
+            figure.canvas.draw_idle()
         self._update_status_labels()
 
     @staticmethod

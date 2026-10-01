@@ -1226,24 +1226,10 @@ def _transformed_axis_arrays(x_data, y_data, x_axis_name='', y_axis_name=''):
 
 
 
-def extract_line_cut(raw_data, x_data, y_data, energy,
-                     cut_type='doping', c_value=0.0,
-                     ratio=0.9, epsilon=0.03,
-                     tg_is_y=True, convention='TG+rBG',
-                     axis_space='gate',
-                     x_axis_name='', y_axis_name='', exact_coordinates=False):
-    """
-    Extract spectra at a constant original X/Y or transformed D/E coordinate.
-
-    When ``axis_space == 'transformed'``, x_data/y_data are treated as the
-    already-loaded doping/efield coordinates directly.
-    """
+def _line_cut_coordinates(x_data, y_data, cut_type, ratio, tg_is_y,
+                          convention, axis_space, x_axis_name, y_axis_name):
+    """Coordinate conversion shared by extraction and lightweight bounds."""
     original = cut_type in {'x', 'y'}
-    exact = original or exact_coordinates
-    if not np.isfinite(epsilon) or epsilon < 0:
-        raise ValueError('epsilon must be finite and zero or positive.')
-    if not np.isfinite(c_value):
-        raise ValueError('The fixed coordinate must be finite.')
     if not original and axis_space not in {'gate', 'transformed'}:
         raise ValueError(
             "Doping/Efield line cuts require BG/TG gate axes or loaded "
@@ -1275,6 +1261,50 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
             e_label = f'{r}·TG − BG (V)'
         else:
             raise ValueError(f"Unknown convention: {convention!r}")
+    return D, E, d_label, e_label
+
+
+def line_cut_axis_limits(x_data, y_data, cut_type, cut_values, ratio, epsilon,
+                         tg_is_y=True, convention='TG+rBG', axis_space='gate',
+                         x_axis_name='', y_axis_name='', exact_coordinates=False):
+    """Union of selected cuts' varying coordinates, without copying spectra."""
+    if not len(cut_values):
+        return None
+    first, second, _, _ = _line_cut_coordinates(x_data, y_data, cut_type, ratio, tg_is_y,
+                                               convention, axis_space, x_axis_name, y_axis_name)
+    fixed, varying = (first, second) if cut_type in {'x', 'doping'} else (second, first)
+    fixed, varying = np.asarray(fixed), np.asarray(varying)
+    exact = cut_type in {'x', 'y'} or exact_coordinates
+    values = np.sort(np.asarray(cut_values))
+    if not exact:
+        fixed, values = np.round(fixed, 6), np.round(values, 6)
+        epsilon = max(epsilon, 1e-3)
+    # Only neighbouring sorted setpoints can be the closest one to a row.
+    index = np.searchsorted(values, fixed)
+    distance = np.minimum(np.abs(fixed - values[np.clip(index, 0, len(values) - 1)]),
+                          np.abs(fixed - values[np.clip(index - 1, 0, len(values) - 1)]))
+    selected = varying[(distance <= epsilon) & np.isfinite(fixed) & np.isfinite(varying)]
+    if selected.size and selected.min() < selected.max():
+        return float(selected.min()), float(selected.max())
+    return None
+
+
+def extract_line_cut(raw_data, x_data, y_data, energy,
+                     cut_type='doping', c_value=0.0,
+                     ratio=0.9, epsilon=0.03,
+                     tg_is_y=True, convention='TG+rBG',
+                     axis_space='gate',
+                     x_axis_name='', y_axis_name='', exact_coordinates=False, spectra=None):
+    """Extract spectra at a constant original X/Y or transformed D/E coordinate."""
+    original = cut_type in {'x', 'y'}
+    exact = original or exact_coordinates
+    if not np.isfinite(epsilon) or epsilon < 0:
+        raise ValueError('epsilon must be finite and zero or positive.')
+    if not np.isfinite(c_value):
+        raise ValueError('The fixed coordinate must be finite.')
+    D, E, d_label, e_label = _line_cut_coordinates(x_data, y_data, cut_type, ratio, tg_is_y,
+                                                 convention, axis_space, x_axis_name, y_axis_name)
+    source = np.asarray(raw_data)[:, 2:] if spectra is None else np.asarray(spectra)
 
     if cut_type in {'x', 'doping'}:
         line_values = D
@@ -1305,7 +1335,7 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
         return {
             'axis_values': empty,
             'axis_label': vary_label,
-            'spectra': np.empty((0, raw_data.shape[1] - 2), dtype=float),
+            'spectra': np.empty((0, source.shape[1]), dtype=float),
             'energy': energy,
             'x_sel': empty,
             'y_sel': empty,
@@ -1328,7 +1358,7 @@ def extract_line_cut(raw_data, x_data, y_data, energy,
     return {
         'axis_values': vary_values[keep],
         'axis_label': vary_label,
-        'spectra': raw_data[keep, 2:],
+        'spectra': source[keep],
         'energy': energy,
         'x_sel': np.asarray(x_data, dtype=float)[keep],
         'y_sel': np.asarray(y_data, dtype=float)[keep],
@@ -1393,7 +1423,11 @@ def _dominant_lattice_member_mask(values, min_fraction=0.75):
 def _measured_slice_values(fixed, varying, epsilon, min_points):
     finite = np.isfinite(fixed) & np.isfinite(varying)
     fixed, varying = fixed[finite], varying[finite]
-    return [float(value) for value in np.unique(fixed)
+    candidates = np.unique(fixed)
+    if min_points == 1:
+        # Each candidate already has its own finite row, even at zero tolerance.
+        return candidates.tolist()
+    return [float(value) for value in candidates
             if np.unique(varying[np.abs(fixed - value) <= epsilon]).size >= min_points]
 
 
@@ -1577,6 +1611,47 @@ def plot_map(X2D, Y2D, Z2D,
     return fig, ax
 
 
+def update_map_colors(figure, values, cmap, vmin=None, vmax=None):
+    """Update the existing mesh and colorbar without rebuilding the figure."""
+    low, high, _ = _resolve_color_limits(values, vmin, vmax)
+    changed = False
+    for artist in [*figure.axes[0].collections, *figure.axes[0].images]:
+        if artist.get_cmap().name != cmap:
+            artist.set_cmap(plt.get_cmap(cmap).with_extremes(bad=artist.get_cmap().get_bad()))
+            changed = True
+        if artist.get_clim() != (low, high):
+            artist.set_clim(low, high)
+            changed = True
+    return changed
+
+
+def spectral_title_precision(values, minimum=6):
+    """Only increase display precision when distinct setpoints would collide."""
+    values = np.unique(np.asarray(values, dtype=float))
+    for precision in range(minimum, 18):
+        if len({f'{value:.{precision}g}' for value in values}) == len(values):
+            return precision
+    return 17
+
+
+def spectral_slice_title(line_cut, precision=6):
+    """Compact display text; source coordinates retain their full precision."""
+    label = line_cut.get('fixed_axis_label', line_cut['cut_type'])
+    unit = ''
+    match = re.fullmatch(r'(.*?)\s*\(([^()]*)\)\s*', label)
+    if match:
+        label, unit = match[1].strip(), match[2].strip()
+    kind = line_cut['cut_type']
+    if kind == 'doping' or label.lower() == 'doping':
+        label = 'D'
+    elif kind == 'efield' or label.lower() == 'efield':
+        label = 'E'
+    title = f"{label} = {line_cut['c_value_used']:.{precision}g}"
+    if unit:
+        title += ' ' + unit
+    return title
+
+
 def plot_line_cut_spectrogram(line_cut: dict,
                                title: str = '',
                                cmap: str = 'RdBu_r',
@@ -1627,6 +1702,14 @@ def plot_line_cut_spectrogram(line_cut: dict,
         ax.set_ylim(ylim)
     if title:
         ax.set_title(title)
+    # Readable defaults shared by previews, PNGs and video-frame rendering.
+    for plot_axis in fig.axes:
+        plot_axis.title.set_fontsize(16)
+        plot_axis.xaxis.label.set_fontsize(14)
+        plot_axis.yaxis.label.set_fontsize(14)
+        plot_axis.tick_params(labelsize=12)
+        plot_axis.xaxis.get_offset_text().set_fontsize(12)
+        plot_axis.yaxis.get_offset_text().set_fontsize(12)
     fig.tight_layout()
     return fig, ax
 
